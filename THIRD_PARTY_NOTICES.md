@@ -9,7 +9,16 @@
 | 日语 → 中文 | [`shun89/opus-mt-ja-zh`](https://huggingface.co/shun89/opus-mt-ja-zh)（revision `0728b51b`） | Apache-2.0（模型页声明） |
 | 中文 → 日语 | [`shun89/opus-mt-zh-ja`](https://huggingface.co/shun89/opus-mt-zh-ja)（revision `8cf1db76`） | 模型页**未声明许可**，属于 OPUS-MT 的衍生模型 |
 
-两者都是基于 [Helsinki-NLP OPUS-MT](https://github.com/Helsinki-NLP/Opus-MT)（Marian NMT，**CC BY 4.0**）的 ja↔zh 微调权重。
+另外内置两个可选的多语种模型（构建时裁剪词表并做 int8 量化）：
+
+| 模型 | 来源 | 许可 |
+|---|---|---|
+| M2M100 418M | [`facebook/m2m100_418M`](https://huggingface.co/facebook/m2m100_418M)（revision `55c2e61b`） | MIT |
+| NLLB-200 distilled 600M | [`facebook/nllb-200-distilled-600M`](https://huggingface.co/facebook/nllb-200-distilled-600M)（revision `f8d333a0`） | **CC BY-NC 4.0（仅限非商业使用）** |
+
+> 含有 NLLB 的 APK 只能用于非商业用途；若需商业分发，请在 `tools/prepare_models.py` 中去掉 `nllb`。
+
+上面两个 OPUS-MT 模型都是基于 [Helsinki-NLP OPUS-MT](https://github.com/Helsinki-NLP/Opus-MT)（Marian NMT，**CC BY 4.0**）的 ja↔zh 微调权重。
 
 构建时由 `tools/prepare_models.py` 下载原始 PyTorch 权重，转换为 ONNX 并做动态 int8 量化后打入 APK；仓库中**不包含**模型文件。
 
@@ -18,6 +27,10 @@
 ## 推理引擎
 
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime)（`com.microsoft.onnxruntime:onnxruntime-android`），MIT License。
+
+## 图标
+
+- 界面图标来自 [Lucide](https://lucide.dev)（ISC License），由 `tools/gen_icons.py` 转换为 Android 矢量图。
 
 ## 分词
 

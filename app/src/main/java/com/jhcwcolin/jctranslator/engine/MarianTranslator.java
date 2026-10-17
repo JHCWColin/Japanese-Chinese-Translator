@@ -26,7 +26,9 @@ import java.util.Map;
 import java.util.Properties;
 
 /**
- * Marian / OPUS-MT translator running on ONNX Runtime.
+ * Marian / OPUS-MT translator running on ONNX Runtime. The same code also drives the
+ * multilingual M2M100 / NLLB models (encoder-decoder with language tokens): the source text gets
+ * the source language token in front and the decoder is forced to start with the target one.
  *
  * <p>Model files (see tools/prepare_models.py): {@code encoder.onnx}, {@code decoder.onnx}
  * (merged decoder with KV cache), {@code source.spm}, {@code target.spm}, {@code vocab.txt},
@@ -89,6 +91,10 @@ public final class MarianTranslator implements AutoCloseable {
 
     private volatile boolean cancelled;
 
+    /** Language tokens of multilingual models (-1 = not used). */
+    private int srcLangId = -1;
+    private int tgtLangId = -1;
+
     public MarianTranslator(File dir, int threads) throws IOException {
         this.dir = dir;
         this.threads = Math.max(1, threads);
@@ -126,9 +132,27 @@ public final class MarianTranslator implements AutoCloseable {
         try (InputStream in = new FileInputStream(new File(dir, "source.spm"))) {
             srcSpm = SentencePieceModel.load(in);
         }
-        try (InputStream in = new FileInputStream(new File(dir, "target.spm"))) {
+        File tgtFile = new File(dir, "target.spm");
+        try (InputStream in = new FileInputStream(tgtFile.isFile() ? tgtFile : new File(dir, "source.spm"))) {
             tgtSpm = SentencePieceModel.load(in);
         }
+    }
+
+    /**
+     * Sets the language tokens (multilingual models only; pass null for plain Marian models).
+     * Takes effect for the next {@link #encode} / {@link #decode}.
+     */
+    public synchronized void setLanguages(String sourceToken, String targetToken) {
+        srcLangId = idOf(sourceToken);
+        tgtLangId = idOf(targetToken);
+    }
+
+    private int idOf(String token) {
+        if (token == null) {
+            return -1;
+        }
+        Integer id = vocabIndex.get(token);
+        return id != null ? id : -1;
     }
 
     public void cancel() {
@@ -269,19 +293,23 @@ public final class MarianTranslator implements AutoCloseable {
     private long[] tokenizeSource(String text) {
         List<String> pieces = srcSpm.encodeToPieces(text);
         int n = Math.min(pieces.size(), MAX_SOURCE_TOKENS);
-        long[] ids = new long[n + 1];
+        int lead = srcLangId >= 0 ? 1 : 0;
+        long[] ids = new long[lead + n + 1];
+        if (lead == 1) {
+            ids[0] = srcLangId;
+        }
         for (int i = 0; i < n; i++) {
             Integer id = vocabIndex.get(pieces.get(i));
-            ids[i] = id != null ? id : unkId;
+            ids[lead + i] = id != null ? id : unkId;
         }
-        ids[n] = eosId; // Marian expects </s> at the end of the source
+        ids[lead + n] = eosId; // Marian expects </s> at the end of the source
         return ids;
     }
 
     private String detokenize(List<Integer> tokens) {
         List<String> pieces = new ArrayList<>(tokens.size());
         for (int t : tokens) {
-            if (t == eosId || t == padId || t == unkId || t < 0 || t >= vocab.length) {
+            if (t == eosId || t == padId || t == unkId || t == tgtLangId || t < 0 || t >= vocab.length) {
                 continue;
             }
             pieces.add(vocab[t]);
@@ -404,7 +432,10 @@ public final class MarianTranslator implements AutoCloseable {
             // ---- step 0: batch of one, no cache --------------------------------------
             OnnxTensor hidden1 = track(toClose, OnnxTensor.createTensor(env, wrapFloats(enc.hidden), new long[]{1, s, dModel}));
             OnnxTensor mask1 = track(toClose, OnnxTensor.createTensor(env, LongBuffer.wrap(ones(s)), new long[]{1, s}));
-            OnnxTensor start = track(toClose, OnnxTensor.createTensor(env, LongBuffer.wrap(new long[]{startId}), new long[]{1, 1}));
+            // Multilingual models: the decoder prefix is <decoder_start> + <target language>.
+            final boolean forced = tgtLangId >= 0;
+            final long[] prefix = forced ? new long[]{startId, tgtLangId} : new long[]{startId};
+            OnnxTensor start = track(toClose, OnnxTensor.createTensor(env, LongBuffer.wrap(prefix), new long[]{1, prefix.length}));
             OnnxTensor dummy = track(toClose, OnnxTensor.createTensor(env, FloatBuffer.wrap(new float[kvBlock]), new long[]{1, heads, 1, headDim}));
             OnnxTensor cacheFlag = track(toClose, OnnxTensor.createTensor(env, new boolean[]{false}));
 
@@ -424,10 +455,10 @@ public final class MarianTranslator implements AutoCloseable {
 
             OrtSession.Result res = decoderSession.run(in0);
             int batch = 1;
-            int pastLen = 0; // length of the self-attention cache fed into the *next* run
+            int pastLen = prefix.length - 1; // length of the self-attention cache fed into the *next* run
 
             List<Hyp> active = new ArrayList<>();
-            active.add(new Hyp(new int[0], 0.0, 0));
+            active.add(new Hyp(forced ? new int[]{tgtLangId} : new int[0], 0.0, 0));
             List<Finished> finished = new ArrayList<>();
 
             OnnxTensor[] crossT = null;
@@ -441,14 +472,18 @@ public final class MarianTranslator implements AutoCloseable {
                     checkCancelled();
 
                     // ---- candidates from the logits of the current batch -------------
-                    FloatBuffer logits = ((OnnxTensor) res.get(0)).getFloatBuffer();
-                    int vocabSize = logits.remaining() / batch;
+                    OnnxTensor logitsT = (OnnxTensor) res.get(0);
+                    FloatBuffer logits = logitsT.getFloatBuffer();
+                    long[] lshape = logitsT.getInfo().getShape(); // [batch, positions, vocab]
+                    int positions = lshape.length >= 3 ? (int) lshape[1] : 1;
+                    int logitDim = lshape.length >= 3 ? (int) lshape[2] : logits.remaining() / (batch * positions);
                     int topK = beams * 2;
                     List<Cand> cands = new ArrayList<>(batch * topK);
-                    float[] row = new float[vocabSize];
+                    float[] row = new float[logitDim];
                     for (int b = 0; b < batch; b++) {
-                        logits.position(b * vocabSize);
-                        logits.get(row, 0, vocabSize);
+                        // only the last position predicts the next token
+                        logits.position((b * positions + positions - 1) * logitDim);
+                        logits.get(row, 0, logitDim);
                         topKLogProbs(row, active.get(b).score, b, topK, cands);
                     }
                     Collections.sort(cands, new Comparator<Cand>() {

@@ -335,6 +335,15 @@ public final class Prefs {
         sp.edit().putInt("direction", d.ordinal()).apply(); // no stamp: not a display setting
     }
 
+    /** Model used for one direction (zh to ja and ja to zh are chosen independently). */
+    public static ModelChoice model(Direction d) {
+        return ModelChoice.fromId(sp.getInt("model_" + d.dir, 0));
+    }
+
+    public static void setModel(Direction d, ModelChoice m) {
+        sp.edit().putInt("model_" + d.dir, m.ordinal()).apply(); // no stamp: not a display setting
+    }
+
     // ---- history -----------------------------------------------------------------------------
 
     public static boolean historyEnabled() {

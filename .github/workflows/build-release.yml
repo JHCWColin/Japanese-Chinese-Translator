@@ -19,9 +19,15 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
 
     steps:
+      # Converting the large multilingual models needs several GB of scratch space.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -46,13 +52,13 @@ jobs:
           cache: pip
           cache-dependency-path: tools/requirements.txt
 
-      # The converted models (~290 MB) are cached; they only change when the conversion script does.
+      # The converted models (~1.4 GB: OPUS-MT, M2M100, NLLB-200) are cached; they only change when the conversion script does.
       - name: Restore converted models
         id: models-cache
         uses: actions/cache@v4
         with:
           path: app/src/main/assets/models
-          key: models-v1-${{ hashFiles('tools/prepare_models.py', 'tools/requirements.txt') }}
+          key: models-v2-${{ hashFiles('tools/prepare_models.py', 'tools/requirements.txt') }}
 
       - name: Convert models (ONNX export + int8 quantization)
         if: steps.models-cache.outputs.cache-hit != 'true'
@@ -65,7 +71,7 @@ jobs:
       - name: Check model files
         run: |
           ls -lh app/src/main/assets/models/*
-          test -f app/src/main/assets/models/VERSION
+          for m in opus-mt m2m100 nllb; do test -f app/src/main/assets/models/$m/VERSION; done
 
       - name: Compute version
         id: ver

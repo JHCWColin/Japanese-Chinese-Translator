@@ -11,6 +11,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -95,6 +96,35 @@ public final class Ui {
         t.setFocusable(true);
         t.setOnClickListener(l);
         return t;
+    }
+
+    /** Lucide icon (vector drawable, black strokes) tinted with the current foreground colour. */
+    public static ImageView icon(Context c, int res, int sizeDp) {
+        ImageView v = new ImageView(c);
+        v.setImageResource(res);
+        v.setImageTintList(ColorStateList.valueOf(fg()));
+        v.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        v.setLayoutParams(new LinearLayout.LayoutParams(dp(c, sizeDp), dp(c, sizeDp)));
+        return v;
+    }
+
+    /** Square icon-only button; looks and behaves like {@link #button} (inverts when pressed). */
+    public static ImageView iconButton(Context c, int res, String description, int iconDp, View.OnClickListener l) {
+        ImageView v = new ImageView(c);
+        v.setImageResource(res);
+        v.setImageTintList(buttonTextColors());
+        v.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        v.setBackground(buttonBackground(c));
+        int side = Math.max(dp(c, 48), dp(c, Prefs.buttonHeightDp()));
+        int pad = Math.max(dp(c, 6), (side - dp(c, iconDp)) / 2);
+        v.setPadding(pad, pad, pad, pad);
+        v.setMinimumWidth(side);
+        v.setMinimumHeight(side);
+        v.setContentDescription(description);
+        v.setClickable(true);
+        v.setFocusable(true);
+        v.setOnClickListener(l);
+        return v;
     }
 
     public static TextView label(Context c, String text, int sp, boolean bold) {

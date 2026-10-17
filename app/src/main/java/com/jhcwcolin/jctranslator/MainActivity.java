@@ -82,14 +82,14 @@ public class MainActivity extends BaseActivity implements TranslatorController.L
         LinearLayout header = Ui.row(c);
         TextView title = Ui.label(c, "日中互译", ui + 6, true);
         header.addView(title, Ui.lp(0, WRAP, 1f));
-        TextView btnHistory = Ui.button(c, "历史", ui, new View.OnClickListener() {
+        View btnHistory = Ui.iconButton(c, R.drawable.ic_history, "历史", 26, new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 syncDraftFromInput();
                 go(HistoryActivity.class);
             }
         });
-        TextView btnSettings = Ui.button(c, "设置", ui, new View.OnClickListener() {
+        View btnSettings = Ui.iconButton(c, R.drawable.ic_settings, "设置", 26, new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 syncDraftFromInput();

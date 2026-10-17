@@ -101,7 +101,7 @@ public class HistoryActivity extends BaseActivity {
 
         // header
         LinearLayout header = Ui.row(c);
-        header.addView(Ui.button(c, "返回", ui, new View.OnClickListener() {
+        header.addView(Ui.iconButton(c, R.drawable.ic_arrow_left, "返回", 26, new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 finish();

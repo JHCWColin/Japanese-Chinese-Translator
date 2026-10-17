@@ -7,7 +7,7 @@ It mirrors what MarianTranslator.java does on the device, so it doubles as a
 build-time sanity check: if the quantised models do not translate sensibly the
 CI build fails instead of shipping a broken APK.
 
-    python tools/smoke_test.py app/src/main/assets/models
+    python tools/smoke_test.py app/src/main/assets/models [opus-mt|m2m100|nllb]
 """
 import sys
 from pathlib import Path
@@ -26,10 +26,15 @@ SAMPLES = {
         ("我每天早上都喝咖啡。", ["コーヒー"]),
     ],
 }
+# multilingual models: language tokens for (source, target) of each direction
+LANG_TOKENS = {
+    "m2m100": {"ja-zh": ("__ja__", "__zh__"), "zh-ja": ("__zh__", "__ja__")},
+    "nllb": {"ja-zh": ("jpn_Jpan", "zho_Hans"), "zh-ja": ("zho_Hans", "jpn_Jpan")},
+}
 
 
 class Model:
-    def __init__(self, d):
+    def __init__(self, d, src_token=None, tgt_token=None):
         import onnxruntime as ort
         import sentencepiece as spm
         d = Path(d)
@@ -37,13 +42,19 @@ class Model:
         for line in (d / "meta.properties").read_text(encoding="utf-8").splitlines():
             if "=" in line:
                 k, v = line.split("=", 1)
-                self.meta[k.strip()] = int(v)
+                try:
+                    self.meta[k.strip()] = int(v)
+                except ValueError:
+                    pass
         self.src = spm.SentencePieceProcessor(model_file=str(d / "source.spm"))
-        self.tgt = spm.SentencePieceProcessor(model_file=str(d / "target.spm"))
+        tgt_file = d / "target.spm"
+        self.tgt = spm.SentencePieceProcessor(model_file=str(tgt_file if tgt_file.exists() else d / "source.spm"))
         self.vocab = (d / "vocab.txt").read_text(encoding="utf-8").split("\n")[:-1]
         self.index = {}
         for i, t in enumerate(self.vocab):
             self.index.setdefault(t, i)
+        self.src_id = self.index[src_token] if src_token else None
+        self.tgt_id = self.index[tgt_token] if tgt_token else None
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 4
         self.enc = ort.InferenceSession(str(d / "encoder.onnx"), opts, providers=["CPUExecutionProvider"])
@@ -52,10 +63,12 @@ class Model:
     def encode(self, text):
         unk = self.index.get("<unk>", 1)
         pieces = self.src.encode(text, out_type=str)
-        return [self.index.get(p, unk) for p in pieces] + [self.meta["eos_token_id"]]
+        lead = [self.src_id] if self.src_id is not None else []
+        return lead + [self.index.get(p, unk) for p in pieces] + [self.meta["eos_token_id"]]
 
     def decode(self, ids):
-        pieces = [self.vocab[i] for i in ids]
+        skip = {self.meta["eos_token_id"], self.meta["pad_token_id"], self.tgt_id}
+        pieces = [self.vocab[i] for i in ids if i not in skip]
         return self.tgt.decode_pieces(pieces)
 
     def translate(self, text, max_new=128):
@@ -69,11 +82,12 @@ class Model:
         past_in = [n for n in in_names if n.startswith("past_key_values.")]
         past = {n: np.zeros((1, m["decoder_heads"], 1, m["head_dim"]), dtype=np.float32) for n in past_in}
         use_cache = False
-        tok = m["decoder_start_token_id"]
+        prefix = [m["decoder_start_token_id"]] + ([self.tgt_id] if self.tgt_id is not None else [])
+        feed_ids = prefix
         out = []
         for _ in range(max_new):
             feed = {
-                "input_ids": np.array([[tok]], dtype=np.int64),
+                "input_ids": np.array([feed_ids], dtype=np.int64),
                 "encoder_attention_mask": mask,
                 "encoder_hidden_states": hs,
             }
@@ -84,6 +98,7 @@ class Model:
             logits = outs["logits"][0, -1].copy()
             logits[m["pad_token_id"]] = -1e9
             tok = int(np.argmax(logits))
+            feed_ids = [tok]
             if tok == m["eos_token_id"]:
                 break
             out.append(tok)
@@ -94,25 +109,35 @@ class Model:
         return self.decode(out)
 
 
-def run(models_dir, verbose_io=True):
+def _check(label, m, direction, failures):
+    if True:
+        print("[smoke] %s decoder inputs : %s" % (label, [(i.name, i.shape) for i in m.dec.get_inputs()][:6]))
+        print("[smoke] %s decoder outputs: %s" % (label, [o.name for o in m.dec.get_outputs()][:6]))
+    for text, expect in SAMPLES[direction]:
+        res = m.translate(text)
+        ok = any(e in res for e in expect)
+        failures.append(0 if ok else 1)
+        print("[smoke] %s | %s -> %s  %s" % (label, text, res, "OK" if ok else "(unexpected)"))
+
+
+def run(models_dir, only=None, verbose_io=True):
     models_dir = Path(models_dir)
-    failures = 0
-    for name, samples in SAMPLES.items():
-        d = models_dir / name
-        if not d.exists():
+    failures = []
+    if only in (None, "opus-mt"):
+        for name in SAMPLES:
+            d = models_dir / "opus-mt" / name
+            if d.exists():
+                _check("opus-mt " + name, Model(d), name, failures)
+    for key, pairs in LANG_TOKENS.items():
+        if only not in (None, key) or not (models_dir / key).exists():
             continue
-        m = Model(d)
-        if verbose_io:
-            print("[smoke] %s decoder inputs : %s" % (name, [(i.name, i.shape) for i in m.dec.get_inputs()][:6]))
-            print("[smoke] %s decoder outputs: %s" % (name, [o.name for o in m.dec.get_outputs()][:6]))
-        for text, expect in samples:
-            res = m.translate(text)
-            ok = any(e in res for e in expect)
-            failures += 0 if ok else 1
-            print("[smoke] %s | %s -> %s  %s" % (name, text, res, "OK" if ok else "(unexpected)"))
-    if failures >= 4:  # tolerate individual misses, fail on systemic breakage
-        sys.exit("smoke test failed: %d unexpected results" % failures)
+        for name, (src_tok, tgt_tok) in pairs.items():
+            _check("%s %s" % (key, name), Model(models_dir / key, src_tok, tgt_tok), name, failures)
+    bad = sum(failures)
+    if bad >= 4:  # tolerate individual misses, fail on systemic breakage
+        sys.exit("smoke test failed: %d unexpected results" % bad)
 
 
 if __name__ == "__main__":
-    run(sys.argv[1] if len(sys.argv) > 1 else "app/src/main/assets/models")
+    run(sys.argv[1] if len(sys.argv) > 1 else "app/src/main/assets/models",
+        only=sys.argv[2] if len(sys.argv) > 2 else None)

@@ -15,6 +15,7 @@ import com.jhcwcolin.jctranslator.engine.MarianTranslator;
 import com.jhcwcolin.jctranslator.engine.ModelStore;
 import com.jhcwcolin.jctranslator.engine.TextSegmenter;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -66,7 +67,7 @@ public final class TranslatorController {
 
     // ---- engine (worker thread) ---------------------------------------------------------------
     private MarianTranslator translator;
-    private Direction loadedDir;
+    private File loadedDir;
     private int loadedThreads;
     private volatile MarianTranslator active;
     private volatile boolean cancelRequested;
@@ -178,6 +179,7 @@ public final class TranslatorController {
     private static final class Job {
         final String text;
         final Direction dir;
+        final ModelChoice model;
         final int beams;
         final int threads;
         final int maxChars;
@@ -189,6 +191,7 @@ public final class TranslatorController {
         Job(String text, Direction dir, boolean lowMemory) {
             this.text = text;
             this.dir = dir;
+            this.model = Prefs.model(dir);
             this.beams = Prefs.beams();
             this.threads = Prefs.effectiveThreads();
             this.maxChars = Prefs.maxSegmentChars();
@@ -334,13 +337,18 @@ public final class TranslatorController {
 
     private void runJob(Job job) {
         try {
-            if (!ModelStore.isInstalled(app)) {
-                publish(Phase.INSTALLING, "首次使用：正在安装翻译模型…",
-                        "模型已内置在安装包中，只需解压一次（约 1～3 分钟），请勿退出");
-                ModelStore.install(app, new ModelStore.Progress() {
+            final ModelChoice model = job.model;
+            if (!ModelStore.isBundled(app, model)) {
+                throw new java.io.IOException("安装包中没有「" + model.title + "」模型，请在设置中换用其他模型");
+            }
+            if (!ModelStore.isInstalled(app, model)) {
+                final String head = "首次使用「" + model.title + "」：正在安装模型…";
+                publish(Phase.INSTALLING, head,
+                        "模型已内置在安装包中，只需解压一次（" + model.size + "，约 1～5 分钟），请勿退出");
+                ModelStore.install(app, model, new ModelStore.Progress() {
                     @Override
                     public void onProgress(String message) {
-                        publish(Phase.INSTALLING, "首次使用：正在安装翻译模型…", message);
+                        publish(Phase.INSTALLING, head, message);
                     }
                 });
                 if (cancelRequested) {
@@ -348,13 +356,15 @@ public final class TranslatorController {
                 }
             }
 
-            if (translator == null || loadedDir != job.dir || loadedThreads != job.threads) {
+            File modelDir = ModelStore.dirFor(app, model, job.dir);
+            if (translator == null || !modelDir.equals(loadedDir) || loadedThreads != job.threads) {
                 closeEngine();
-                publish(Phase.LOADING, "正在加载翻译词表…", job.dir.label());
-                translator = new MarianTranslator(ModelStore.dirFor(app, job.dir), job.threads);
-                loadedDir = job.dir;
+                publish(Phase.LOADING, "正在加载翻译词表…", job.dir.label() + " · " + model.title);
+                translator = new MarianTranslator(modelDir, job.threads);
+                loadedDir = modelDir;
                 loadedThreads = job.threads;
             }
+            translator.setLanguages(model.sourceToken(job.dir), model.targetToken(job.dir));
             final MarianTranslator t = translator;
             active = t;
             t.resetCancel();
@@ -371,7 +381,7 @@ public final class TranslatorController {
 
             final String loadHint = job.lowMemory ? "省内存模式：分步加载，请耐心等待" : "首次加载较慢，请耐心等待";
             if (!t.isEncoderLoaded()) {
-                publish(Phase.LOADING, "正在加载翻译模型（1/2）…", job.dir.label() + " · " + loadHint);
+                publish(Phase.LOADING, "正在加载翻译模型（1/2）…", job.dir.label() + " · " + model.title + " · " + loadHint);
                 t.loadEncoder();
             }
 
@@ -395,7 +405,7 @@ public final class TranslatorController {
             }
 
             if (!t.isDecoderLoaded()) {
-                publish(Phase.LOADING, "正在加载翻译模型（2/2）…", job.dir.label() + " · " + loadHint);
+                publish(Phase.LOADING, "正在加载翻译模型（2/2）…", job.dir.label() + " · " + model.title + " · " + loadHint);
                 t.loadDecoder();
             }
 
@@ -463,7 +473,7 @@ public final class TranslatorController {
                 failed = false;
                 result = translation;
                 status = translation.isEmpty() ? "没有可翻译的内容" : "翻译完成";
-                detail = String.format(Locale.US, "用时 %.1f 秒 · %s", sec, job.dir.label())
+                detail = String.format(Locale.US, "用时 %.1f 秒 · %s · %s", sec, job.dir.label(), job.model.title)
                         + (job.saveHistory && !translation.isEmpty() ? " · 已保存到历史记录" : "");
                 if (job.autoCopy && !translation.isEmpty()) {
                     copyText(app, "translation", translation);

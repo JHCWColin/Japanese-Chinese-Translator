@@ -57,6 +57,11 @@ android {
         abortOnError false
     }
 
+    // Model files are incompressible int8 weights: store them as-is (faster build, faster first run).
+    androidResources {
+        noCompress 'onnx', 'spm', 'txt', 'properties'
+    }
+
     packaging {
         jniLibs {
             useLegacyPackaging false

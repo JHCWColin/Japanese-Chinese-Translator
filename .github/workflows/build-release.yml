@@ -1,0 +1,149 @@
+name: Build APK
+
+# - every push to main / manual run : builds a signed release APK and uploads it as a workflow artifact
+# - pushing a tag like v1.0.0       : additionally publishes the APK as a GitHub Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: tools/requirements.txt
+
+      # The converted models (~290 MB) are cached; they only change when the conversion script does.
+      - name: Restore converted models
+        id: models-cache
+        uses: actions/cache@v4
+        with:
+          path: app/src/main/assets/models
+          key: models-v1-${{ hashFiles('tools/prepare_models.py', 'tools/requirements.txt') }}
+
+      - name: Convert models (ONNX export + int8 quantization)
+        if: steps.models-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install -r tools/requirements.txt
+          python tools/prepare_models.py --out app/src/main/assets --work "$RUNNER_TEMP/model-work" --smoke
+
+      - name: Check model files
+        run: |
+          ls -lh app/src/main/assets/models/*
+          test -f app/src/main/assets/models/VERSION
+
+      - name: Compute version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="1.0.0-dev.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "name=$V" >> "$GITHUB_OUTPUT"
+          echo "Version: $V (code $GITHUB_RUN_NUMBER)"
+
+      - name: Prepare signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          SECRET_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          SECRET_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          SECRET_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          KS="$RUNNER_TEMP/release.jks"
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+            STORE_PASS="$SECRET_KEYSTORE_PASSWORD"
+            ALIAS="$SECRET_KEY_ALIAS"
+            KEY_PASS="$SECRET_KEY_PASSWORD"
+          else
+            echo "::warning::No signing secrets configured - using a temporary key. APKs signed with different keys cannot be installed over each other."
+            STORE_PASS="$(openssl rand -hex 16)"
+            echo "::add-mask::$STORE_PASS"
+            ALIAS="release"
+            KEY_PASS="$STORE_PASS"
+            keytool -genkeypair -keystore "$KS" -storepass "$STORE_PASS" -alias "$ALIAS" -keypass "$KEY_PASS" \
+              -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Japanese Chinese Translator, O=JHCWColin"
+          fi
+          {
+            echo "KEYSTORE_FILE=$KS"
+            echo "KEYSTORE_PASSWORD=$STORE_PASS"
+            echo "KEY_ALIAS=$ALIAS"
+            echo "KEY_PASSWORD=$KEY_PASS"
+          } >> "$GITHUB_ENV"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build release APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease \
+            -PappVersionName="${{ steps.ver.outputs.name }}" \
+            -PappVersionCode="${{ github.run_number }}"
+
+      - name: Verify signature and name the APK
+        run: |
+          APK=app/build/outputs/apk/release/app-release.apk
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs "$APK"
+          OUT="JapaneseChineseTranslator-v${{ steps.ver.outputs.name }}.apk"
+          cp "$APK" "$OUT"
+          sha256sum "$OUT" | tee "$OUT.sha256"
+          ls -lh "$OUT"
+          echo "APK_FILE=$OUT" >> "$GITHUB_ENV"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JapaneseChineseTranslator-apk
+          path: |
+            ${{ env.APK_FILE }}
+            ${{ env.APK_FILE }}.sha256
+          compression-level: 0
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: 日中互译 ${{ github.ref_name }}
+          files: |
+            ${{ env.APK_FILE }}
+            ${{ env.APK_FILE }}.sha256
+          body_path: .github/release-notes.md
+          fail_on_unmatched_files: true

@@ -1,0 +1,11 @@
+# Dependencies of tools/prepare_models.py (build-time only, NOT shipped in the APK)
+# Install CPU PyTorch first:
+#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+numpy<2
+transformers==4.46.3
+optimum==1.23.3
+onnx==1.17.0
+onnxruntime==1.20.1
+sentencepiece==0.2.0
+huggingface_hub>=0.25,<1.0
+protobuf<5

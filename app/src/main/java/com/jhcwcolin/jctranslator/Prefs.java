@@ -312,8 +312,13 @@ public final class Prefs {
         touch();
     }
 
-    /** Resolves {@link #memoryMode()}: automatic mode uses low-memory handling below 2 GB of RAM. */
-    public static boolean lowMemory(Context c) {
+    /**
+     * Resolves {@link #memoryMode()} for {@code model}. Automatic mode keeps the sessions resident
+     * only when the memory that is available right now covers both of them (the weights are
+     * memory-mapped, plus roughly the same again for ONNX Runtime's working buffers) with a
+     * reserve left for the system; otherwise encoder and decoder are loaded one after the other.
+     */
+    public static boolean lowMemory(Context c, ModelChoice model) {
         int mode = memoryMode();
         if (mode == MEMORY_LOW) {
             return true;
@@ -324,7 +329,8 @@ public final class Prefs {
         ActivityManager am = (ActivityManager) c.getSystemService(Context.ACTIVITY_SERVICE);
         ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
         am.getMemoryInfo(mi);
-        return mi.totalMem < 2L * 1024 * 1024 * 1024;
+        long needBytes = (2L * model.weightMb + 220L) * 1024 * 1024;
+        return mi.totalMem < 1024L * 1024 * 1024 && model.weightMb > 200 || mi.availMem < needBytes;
     }
 
     public static Direction lastDirection() {
@@ -337,7 +343,10 @@ public final class Prefs {
 
     /** Model used for one direction (zh to ja and ja to zh are chosen independently). */
     public static ModelChoice model(Direction d) {
-        return ModelChoice.fromId(sp.getInt("model_" + d.dir, 0));
+        // The target device has 1 GB RAM and commonly has less than 400 MB free after the
+        // reader/keyboard are started.  Make the pruned model the first-run default so the
+        // standard OPUS-MT remains available as an explicit quality/size choice.
+        return ModelChoice.fromId(sp.getInt("model_" + d.dir, ModelChoice.OPUS_LITE.ordinal()));
     }
 
     public static void setModel(Direction d, ModelChoice m) {

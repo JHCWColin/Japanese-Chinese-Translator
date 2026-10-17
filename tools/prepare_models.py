@@ -3,11 +3,14 @@
 """
 Prepare the offline translation models that get bundled into the APK.
 
-Three selectable models (the user picks one per direction in the app):
+Four selectable models (the user picks one per direction in the app):
 
   opus-mt   Marian / OPUS-MT, ~77M parameters, one model per direction (default, small and fast)
               shun89/opus-mt-ja-zh   Japanese -> Chinese
               shun89/opus-mt-zh-ja   Chinese  -> Japanese
+  opus-lite The same two OPUS-MT models with a pruned vocabulary (65k -> ~28k tokens: the most
+            frequent ones on a corpus sample plus the best BPE merges).  The embedding matrix is two thirds of the model, so
+            this halves file size and RAM (see tools/lite_vocab.py)
   m2m100    facebook/m2m100_418M            multilingual, both directions in one model (MIT)
   nllb      facebook/nllb-200-distilled-600M  multilingual, both directions in one model (CC-BY-NC-4.0)
 
@@ -19,14 +22,18 @@ a 1 GB device.
 
 Pipeline for each model:
     1. download the PyTorch checkpoint from HuggingFace (or use --src-dir for opus-mt)
-    2. (multilingual only) prune the vocabulary
+    2. (multilingual / lite only) prune the vocabulary
     3. export to ONNX with a KV cache (optimum):  encoder + merged decoder
     4. dynamic int8 quantisation (weights int8, ~4x smaller)
-    5. write tokenizer assets (SentencePiece models, id-ordered vocab.txt) and meta.properties
+    5. move the weights into an external data file next to each .onnx (the on-device ONNX Runtime
+       then memory-maps them instead of copying ~100 MB into the Java/native heap while loading)
+    6. write tokenizer assets (SentencePiece models, id-ordered vocab.txt) and meta.properties
 
-Output layout (consumed by the Android app, see ModelStore.java):
-    <out>/models/opus-mt/<ja-zh|zh-ja>/{encoder.onnx,decoder.onnx,source.spm,target.spm,vocab.txt,meta.properties}
+Output layout (consumed by the Android app, see ModelStore.java; every file in a folder is copied):
+    <out>/models/opus-mt/<ja-zh|zh-ja>/{encoder.onnx,encoder.onnx_data,decoder.onnx,decoder.onnx_data,
+                                         source.spm,target.spm,vocab.txt,meta.properties}
     <out>/models/opus-mt/VERSION
+    <out>/models/opus-lite/...   (same layout)
     <out>/models/<m2m100|nllb>/{encoder.onnx,decoder.onnx,source.spm,vocab.txt,meta.properties}
     <out>/models/<m2m100|nllb>/VERSION        (target.spm is omitted: the app reuses source.spm)
 
@@ -35,6 +42,7 @@ Usage:
 """
 import argparse
 import hashlib
+import os
 import json
 import shutil
 import sys
@@ -68,8 +76,13 @@ MULTI = {
         "langs": {"ja": "jpn_Jpan", "zh": "zho_Hans"},
     },
 }
-ALL_KEYS = ["opus-mt"] + list(MULTI)
-PIPELINE_VERSION = "q2"
+ALL_KEYS = ["opus-mt", "opus-lite"] + list(MULTI)
+PIPELINE_VERSION = "q3"
+# opus-lite: number of vocabulary tokens kept and the size of the corpus sample used to count token
+# frequencies.  Measured on news_commentary ja-zh (chrF, original 19.2 / 22.9): 24k 17.5 / 19.9,
+# 28k 17.6 / 20.8, 32k 18.4 / 21.6.  LITE_VOCAB / LITE_MODE (corpus|prefix|mix) override for experiments.
+LITE_TARGET_VOCAB = int(os.environ.get("LITE_VOCAB", "28000"))
+LITE_CORPUS_SENTENCES = 200000
 # Of the ASCII-only (mostly European-language) SentencePiece tokens longer than 2 characters, keep
 # this many by SentencePiece score.  Names, English words and numbers are still covered; anything
 # else falls back to shorter pieces.
@@ -121,6 +134,8 @@ def convert_to_onnx(model_dir, work_dir, dst):
         shutil.rmtree(work_dir)
     files = export_onnx(model_dir, work_dir)
     dst.mkdir(parents=True, exist_ok=True)
+    for stale in dst.glob("*.onnx*"):
+        stale.unlink()
     quantize(files["encoder_model"], dst / "encoder.onnx")
     # The merged (If-based) decoder cannot be quantised directly because the quantiser
     # does not descend into sub-graphs.  Quantise both decoders separately and merge
@@ -134,6 +149,21 @@ def convert_to_onnx(model_dir, work_dir, dst):
                    save_path=dst / "decoder.onnx", strict=False)
     log("merged decoder: %.1f MB" % ((dst / "decoder.onnx").stat().st_size / 1e6))
     shutil.rmtree(work_dir, ignore_errors=True)  # free disk for the next model
+    externalize(dst / "encoder.onnx")
+    externalize(dst / "decoder.onnx")
+
+
+def externalize(path):
+    """Moves the weights of an .onnx file into <name>.onnx_data (same folder)."""
+    import onnx
+    data = path.with_name(path.name + "_data")
+    if data.exists():
+        data.unlink()
+    model = onnx.load(str(path))
+    onnx.save_model(model, str(path), save_as_external_data=True, all_tensors_to_one_file=True,
+                    location=data.name, size_threshold=1024, convert_attribute=False)
+    del model
+    log("%s: graph %.2f MB + weights %.1f MB" % (path.name, path.stat().st_size / 1e6, data.stat().st_size / 1e6))
 
 
 def write_vocab_list(table, dst):
@@ -200,6 +230,121 @@ def build_opus(out_models, work, src_dir):
         meta = write_meta(model_dir, size, dst / "meta.properties")
         log("%s done in %.0fs, meta=%s" % (name, time.time() - t0, meta))
     write_version(out_models / "opus-mt", revs)
+
+
+# ------------------------------------------------------------------------------------------------
+# opus-lite: OPUS-MT with a pruned vocabulary
+# ------------------------------------------------------------------------------------------------
+
+def prune_marian(src_dir, keep_ids, dst_dir):
+    """Rewrites a Marian checkpoint so that only the tokens in keep_ids (old ids, ascending) remain."""
+    import torch
+    from transformers import MarianMTModel
+
+    model = MarianMTModel.from_pretrained(str(src_dir), torch_dtype=torch.float32)
+    cfg = model.config
+    remap = {old: new for new, old in enumerate(keep_ids)}
+    idx = torch.tensor(keep_ids, dtype=torch.long)
+    new_v = len(keep_ids)
+
+    weight = model.get_input_embeddings().weight.data[idx].clone()
+    emb = torch.nn.Embedding(new_v, weight.shape[1], padding_idx=remap[cfg.pad_token_id])
+    emb.weight = torch.nn.Parameter(weight)
+    model.set_input_embeddings(emb)               # shared + encoder + decoder embeddings
+    model.lm_head = torch.nn.Linear(weight.shape[1], new_v, bias=False)
+    model.lm_head.weight = emb.weight             # tied output projection
+    model.final_logits_bias = model.final_logits_bias[:, idx].clone()
+
+    ids = {
+        "pad_token_id": remap[cfg.pad_token_id],
+        "decoder_start_token_id": remap[cfg.decoder_start_token_id],
+        "eos_token_id": remap[cfg.eos_token_id],
+        "bos_token_id": remap[cfg.bos_token_id],
+        "forced_eos_token_id": remap[cfg.forced_eos_token_id],
+        "vocab_size": new_v,
+        "decoder_vocab_size": new_v,
+        "bad_words_ids": [[remap[cfg.pad_token_id]]],
+    }
+    for k, v in ids.items():
+        setattr(cfg, k, v)
+        if hasattr(model.generation_config, k):
+            setattr(model.generation_config, k, v)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(str(dst_dir), safe_serialization=False)
+    del model, emb, weight
+    return ids
+
+
+def build_opus_lite(out_models, work, src_dir):
+    import lite_vocab
+    from sentencepiece import sentencepiece_model_pb2 as spb  # noqa: F401  (fail early if missing)
+    import sentencepiece as spm
+
+    t0 = time.time()
+    log("=== opus-lite")
+    model_dirs, revs = {}, []
+    for name, spec in OPUS.items():
+        if src_dir:
+            model_dirs[name] = Path(src_dir) / name
+            revs.append(spec.get("revision") or "local")
+        else:
+            model_dirs[name] = snapshot(spec["repo"], spec["revision"], OPUS_FILES, work / "hf" / name)
+            revs.append(spec["revision"] or "main")
+
+    # ja side = source.spm of ja-zh, zh side = target.spm of ja-zh (zh-ja uses the same two models)
+    spm_bytes = {"ja": (model_dirs["ja-zh"] / "source.spm").read_bytes(),
+                 "zh": (model_dirs["ja-zh"] / "target.spm").read_bytes()}
+    if (model_dirs["zh-ja"] / "source.spm").read_bytes() != spm_bytes["zh"] or \
+            (model_dirs["zh-ja"] / "target.spm").read_bytes() != spm_bytes["ja"]:
+        log("WARNING: the zh-ja SentencePiece models differ from the ja-zh ones; pruning uses the ja-zh ones")
+    vocab = json.loads((model_dirs["ja-zh"] / "vocab.json").read_text(encoding="utf-8"))
+    if vocab != json.loads((model_dirs["zh-ja"] / "vocab.json").read_text(encoding="utf-8")):
+        sys.exit("ja-zh and zh-ja use different vocabularies: opus-lite assumes a shared one")
+    inv = {i: t for t, i in vocab.items()}
+    specials = {inv[i] for i in {0, 1, max(vocab.values())} if i in inv}
+    models = {side: lite_vocab.spm_scores(b) for side, b in spm_bytes.items()}
+
+    corpus = lite_vocab.load_corpus(work, LITE_CORPUS_SENTENCES)
+    if corpus:
+        held = {k: v[-4000:] for k, v in corpus.items()}
+        train = {k: v[:-4000] for k, v in corpus.items()}
+        counts = {k: lite_vocab.count_pieces(spm.SentencePieceProcessor(model_proto=spm_bytes[k]), train[k])
+                  for k in train}
+        mode = os.environ.get("LITE_MODE", "mix")
+        if mode == "prefix":
+            keep_ids = lite_vocab.select_prefix(vocab, models, specials, LITE_TARGET_VOCAB)
+        elif mode == "mix":
+            first = lite_vocab.select(vocab, models, counts, specials, int(LITE_TARGET_VOCAB * 0.6))
+            keep_ids = lite_vocab.select_prefix(vocab, models, specials, LITE_TARGET_VOCAB,
+                                                keep={inv[i] for i in first})
+        else:
+            keep_ids = lite_vocab.select(vocab, models, counts, specials, LITE_TARGET_VOCAB)
+    else:
+        held = None
+        keep_ids = lite_vocab.select_by_score(vocab, models, specials, LITE_TARGET_VOCAB, _char_ok)
+    kept_tokens = {inv[i] for i in keep_ids}
+    log("vocabulary pruned: %d -> %d tokens" % (len(vocab), len(keep_ids)))
+    pruned_spm = {side: lite_vocab.prune_spm(b, kept_tokens) for side, b in spm_bytes.items()}
+    if held:
+        for side in pruned_spm:
+            lite_vocab.evaluate(spm_bytes[side], pruned_spm[side], held[side], "tokenizer " + side)
+
+    table = [inv[i] for i in keep_ids]
+    for name, spec in OPUS.items():
+        t1 = time.time()
+        src_side, tgt_side = ("ja", "zh") if name == "ja-zh" else ("zh", "ja")
+        pruned = work / "pruned" / ("lite-" + name)
+        prune_marian(model_dirs[name], keep_ids, pruned)
+        dst = out_models / "opus-lite" / name
+        convert_to_onnx(pruned, work / "onnx" / ("lite-" + name), dst)
+        (dst / "source.spm").write_bytes(pruned_spm[src_side])
+        (dst / "target.spm").write_bytes(pruned_spm[tgt_side])
+        size = write_vocab_list(list(table), dst / "vocab.txt")
+        meta = write_meta(pruned, size, dst / "meta.properties")
+        shutil.rmtree(pruned, ignore_errors=True)
+        log("lite %s done in %.0fs, meta=%s" % (name, time.time() - t1, meta))
+    write_version(out_models / "opus-lite", revs + ["v%d" % LITE_TARGET_VOCAB])
+    log("opus-lite done in %.0fs" % (time.time() - t0))
 
 
 # ------------------------------------------------------------------------------------------------
@@ -349,6 +494,8 @@ def main():
             continue
         if key == "opus-mt":
             build_opus(out_models, work, args.src_dir)
+        elif key == "opus-lite":
+            build_opus_lite(out_models, work, args.src_dir)
         else:
             build_multi(key, out_models, work)
         if args.smoke:

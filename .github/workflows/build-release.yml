@@ -1,13 +1,22 @@
 name: Build APK
 
-# - every push to main / manual run : builds a signed release APK and uploads it as a workflow artifact
-# - pushing a tag like v1.0.0       : additionally publishes the APK as a GitHub Release
+# Two APK variants (same package name and signature, so one can be installed over the other):
+#   standard : OPUS-MT + OPUS-MT lite + M2M100 (~1.0 GB)
+#   full     : standard + NLLB-200 (~1.7 GB)
+# - every push to main            : builds the standard APK and uploads it as a workflow artifact
+# - manual run with "full" ticked : also builds the full APK
+# - pushing a tag like v1.0.0     : builds both and publishes them as a GitHub Release
 
 on:
   push:
     branches: [main]
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      full:
+        description: 'Also build the full APK with NLLB-200 (slow)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -20,6 +29,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON((startsWith(github.ref, 'refs/tags/v') || inputs.full) && '["standard","full"]' || '["standard"]') }}
 
     steps:
       # Converting the large multilingual models needs several GB of scratch space.
@@ -52,26 +65,62 @@ jobs:
           cache: pip
           cache-dependency-path: tools/requirements.txt
 
-      # The converted models (~1.4 GB: OPUS-MT, M2M100, NLLB-200) are cached; they only change when the conversion script does.
-      - name: Restore converted models
-        id: models-cache
+      # The converted models are cached; they only change when the conversion scripts do.
+      # OPUS-MT + OPUS-MT lite + M2M100 go into every APK; NLLB-200 is only in the full one.
+      - name: Restore converted models (OPUS-MT)
+        id: cache-opus
         uses: actions/cache@v4
         with:
-          path: app/src/main/assets/models
-          key: models-v2-${{ hashFiles('tools/prepare_models.py', 'tools/requirements.txt') }}
+          path: |
+            app/src/main/assets/models/opus-mt
+            app/src/main/assets/models/opus-lite
+          key: models-opus-v3-${{ hashFiles('tools/prepare_models.py', 'tools/lite_vocab.py', 'tools/requirements.txt') }}
 
-      - name: Convert models (ONNX export + int8 quantization)
-        if: steps.models-cache.outputs.cache-hit != 'true'
+      - name: Restore converted model (M2M100)
+        id: cache-m2m
+        uses: actions/cache@v4
+        with:
+          path: app/src/main/assets/models/m2m100
+          key: models-m2m-v4-${{ hashFiles('tools/prepare_models.py', 'tools/requirements.txt') }}
+
+      - name: Restore converted model (NLLB-200)
+        id: cache-nllb
+        if: matrix.variant == 'full'
+        uses: actions/cache@v4
+        with:
+          path: app/src/main/assets/models/nllb
+          key: models-nllb-v4-${{ hashFiles('tools/prepare_models.py', 'tools/requirements.txt') }}
+
+      - name: Install conversion tools
+        if: steps.cache-opus.outputs.cache-hit != 'true' || steps.cache-m2m.outputs.cache-hit != 'true' || (matrix.variant == 'full' && steps.cache-nllb.outputs.cache-hit != 'true')
         run: |
           python -m pip install --upgrade pip
           pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
           pip install -r tools/requirements.txt
-          python tools/prepare_models.py --out app/src/main/assets --work "$RUNNER_TEMP/model-work" --smoke
+
+      - name: Convert OPUS-MT models (ONNX export + int8 quantization + vocabulary pruning)
+        if: steps.cache-opus.outputs.cache-hit != 'true'
+        run: |
+          python tools/prepare_models.py --out app/src/main/assets --work "$RUNNER_TEMP/model-work" --only opus-mt --smoke
+          python tools/prepare_models.py --out app/src/main/assets --work "$RUNNER_TEMP/model-work" --only opus-lite --smoke
+
+      - name: Convert M2M100
+        if: steps.cache-m2m.outputs.cache-hit != 'true'
+        run: |
+          python tools/prepare_models.py --out app/src/main/assets --work "$RUNNER_TEMP/model-work" --only m2m100 --smoke
+
+      - name: Convert NLLB-200
+        if: matrix.variant == 'full' && steps.cache-nllb.outputs.cache-hit != 'true'
+        run: |
+          python tools/prepare_models.py --out app/src/main/assets --work "$RUNNER_TEMP/model-work" --only nllb --smoke
 
       - name: Check model files
         run: |
-          ls -lh app/src/main/assets/models/*
-          for m in opus-mt m2m100 nllb; do test -f app/src/main/assets/models/$m/VERSION; done
+          ls -lhR app/src/main/assets/models | head -80
+          MODELS="opus-mt opus-lite m2m100"
+          if [ "${{ matrix.variant }}" = "full" ]; then MODELS="$MODELS nllb"; fi
+          for m in $MODELS; do test -f app/src/main/assets/models/$m/VERSION; done
+          du -sh app/src/main/assets/models/*
 
       - name: Compute version
         id: ver
@@ -81,6 +130,8 @@ jobs:
           else
             V="1.0.0-dev.${GITHUB_RUN_NUMBER}"
           fi
+          if [ "${{ matrix.variant }}" = "full" ]; then SUFFIX="-full"; else SUFFIX=""; fi
+          echo "suffix=$SUFFIX" >> "$GITHUB_OUTPUT"
           echo "name=$V" >> "$GITHUB_OUTPUT"
           echo "Version: $V (code $GITHUB_RUN_NUMBER)"
 
@@ -127,7 +178,7 @@ jobs:
         run: |
           APK=app/build/outputs/apk/release/app-release.apk
           "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs "$APK"
-          OUT="JapaneseChineseTranslator-v${{ steps.ver.outputs.name }}.apk"
+          OUT="JapaneseChineseTranslator-v${{ steps.ver.outputs.name }}${{ steps.ver.outputs.suffix }}.apk"
           cp "$APK" "$OUT"
           sha256sum "$OUT" | tee "$OUT.sha256"
           ls -lh "$OUT"
@@ -136,20 +187,32 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: JapaneseChineseTranslator-apk
+          name: JapaneseChineseTranslator-apk-${{ matrix.variant }}
           path: |
             ${{ env.APK_FILE }}
             ${{ env.APK_FILE }}.sha256
           compression-level: 0
           retention-days: 30
 
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (release notes)
+        uses: actions/checkout@v4
+
+      - name: Download APKs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: JapaneseChineseTranslator-apk-*
+          merge-multiple: true
+          path: release-files
+
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           name: 日中互译 ${{ github.ref_name }}
-          files: |
-            ${{ env.APK_FILE }}
-            ${{ env.APK_FILE }}.sha256
+          files: release-files/*
           body_path: .github/release-notes.md
           fail_on_unmatched_files: true

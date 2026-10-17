@@ -16,6 +16,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -23,6 +24,10 @@ import java.util.List;
 /**
  * Copies the models bundled in the APK (assets/models) into the app's private storage, because
  * ONNX Runtime needs real files. Each model is extracted on first use (once per app/model version).
+ *
+ * <p>The files of a model folder are taken from the asset listing (encoder.onnx, encoder.onnx_data,
+ * decoder.onnx, decoder.onnx_data, source.spm, ...), so the build script decides what a model
+ * consists of. Extraction can be resumed: files that were already copied completely are kept.
  */
 public final class ModelStore {
 
@@ -30,17 +35,8 @@ public final class ModelStore {
         void onProgress(String message);
     }
 
-    private static final String[] FILES = {
-            "encoder.onnx", "decoder.onnx", "source.spm", "target.spm", "vocab.txt", "meta.properties"
-    };
-    /** Multilingual models share one SentencePiece model, so they ship without target.spm. */
-    private static final String[] FILES_MULTILINGUAL = {
-            "encoder.onnx", "decoder.onnx", "source.spm", "vocab.txt", "meta.properties"
-    };
-
-    private static String[] filesOf(ModelChoice m) {
-        return m.multilingual ? FILES_MULTILINGUAL : FILES;
-    }
+    private static final String VERSION_FILE = "VERSION";
+    private static final String PARTIAL_FILE = "VERSION.partial";
     /** Free space kept in reserve on top of the files being written. */
     private static final long HEADROOM_BYTES = 120L * 1024 * 1024;
 
@@ -69,11 +65,10 @@ public final class ModelStore {
     }
 
     private static String readAssetVersion(Context c, ModelChoice m) throws IOException {
-        return readFirstLine(c.getAssets().open("models/" + m.key + "/VERSION"));
+        return readFirstLine(c.getAssets().open("models/" + m.key + "/" + VERSION_FILE));
     }
 
-    private static String readInstalledVersion(Context c, ModelChoice m) {
-        File f = new File(new File(root(c), m.key), "VERSION");
+    private static String readVersionFile(File f) {
         if (!f.isFile()) {
             return null;
         }
@@ -94,15 +89,37 @@ public final class ModelStore {
         }
     }
 
+    /** Names of the files in the asset folder of one model/direction (without VERSION). */
+    private static List<String> assetFiles(Context c, ModelChoice m, Direction d) throws IOException {
+        String[] names = c.getAssets().list(assetDir(m, d));
+        List<String> out = new ArrayList<>();
+        if (names != null) {
+            for (String n : names) {
+                if (!n.equals(VERSION_FILE)) {
+                    out.add(n);
+                }
+            }
+        }
+        return out;
+    }
+
+    private static String assetDir(ModelChoice m, Direction d) {
+        return "models/" + m.key + (m.multilingual ? "" : "/" + d.dir);
+    }
+
     public static boolean isInstalled(Context c, ModelChoice m) {
         try {
             String want = readAssetVersion(c, m);
-            String have = readInstalledVersion(c, m);
+            String have = readVersionFile(new File(new File(root(c), m.key), VERSION_FILE));
             if (have == null || !have.equals(want)) {
                 return false;
             }
             for (Direction d : directions(m)) {
-                for (String f : filesOf(m)) {
+                List<String> files = assetFiles(c, m, d);
+                if (files.isEmpty()) {
+                    return false;
+                }
+                for (String f : files) {
                     if (!new File(dirFor(c, m, d), f).isFile()) {
                         return false;
                     }
@@ -118,26 +135,39 @@ public final class ModelStore {
         try (AssetFileDescriptor fd = c.getAssets().openFd(path)) {
             return fd.getLength();
         } catch (IOException e) {
-            return 0; // compressed asset: size unknown, rely on the headroom check only
+            return -1; // compressed asset: size unknown
         }
-    }
-
-    private static String assetPath(ModelChoice m, Direction d, String name) {
-        return "models/" + m.key + (m.multilingual ? "" : "/" + d.dir) + "/" + name;
     }
 
     /** Extracts one model; other models that are already extracted are left alone. */
     public static void install(Context c, ModelChoice m, Progress progress) throws IOException {
         String version = readAssetVersion(c, m);
         File modelRoot = new File(root(c), m.key);
-        deleteRecursively(modelRoot);
+
+        // Resume only a partial extraction of exactly this version; anything else starts clean.
+        boolean resume = version.equals(readVersionFile(new File(modelRoot, PARTIAL_FILE)));
+        new File(modelRoot, VERSION_FILE).delete();
+        if (!resume) {
+            deleteRecursively(modelRoot);
+        }
         if (!modelRoot.mkdirs() && !modelRoot.isDirectory()) {
             throw new IOException("无法创建模型目录");
         }
+        try (OutputStream out = new FileOutputStream(new File(modelRoot, PARTIAL_FILE))) {
+            out.write((version + "\n").getBytes(StandardCharsets.UTF_8));
+        }
+
+        List<Direction> dirs = directions(m);
+        int total = 0;
         long need = HEADROOM_BYTES;
-        for (Direction d : directions(m)) {
-            for (String name : filesOf(m)) {
-                need += assetSize(c, assetPath(m, d, name));
+        for (Direction d : dirs) {
+            for (String name : assetFiles(c, m, d)) {
+                total++;
+                long size = assetSize(c, assetDir(m, d) + "/" + name);
+                File existing = new File(dirFor(c, m, d), name);
+                if (!(resume && size >= 0 && existing.isFile() && existing.length() == size)) {
+                    need += Math.max(size, 0);
+                }
             }
         }
         StatFs fs = new StatFs(c.getFilesDir().getAbsolutePath());
@@ -146,19 +176,24 @@ public final class ModelStore {
                     + "当前仅剩 " + (fs.getAvailableBytes() / 1024 / 1024) + " MB。请清理后重试。");
         }
 
-        int total = directions(m).size() * filesOf(m).length;
         int done = 0;
         long copied = 0;
-        byte[] buf = new byte[256 * 1024];
-        for (Direction d : directions(m)) {
+        byte[] buf = new byte[128 * 1024];
+        for (Direction d : dirs) {
             File dir = dirFor(c, m, d);
             if (!dir.mkdirs() && !dir.isDirectory()) {
                 throw new IOException("无法创建目录：" + dir);
             }
-            for (String name : filesOf(m)) {
+            for (String name : assetFiles(c, m, d)) {
+                String asset = assetDir(m, d) + "/" + name;
                 File tmp = new File(dir, name + ".tmp");
                 File dst = new File(dir, name);
-                try (InputStream in = c.getAssets().open(assetPath(m, d, name));
+                long size = assetSize(c, asset);
+                if (resume && size >= 0 && dst.isFile() && dst.length() == size) {
+                    done++;
+                    continue;
+                }
+                try (InputStream in = c.getAssets().open(asset, android.content.res.AssetManager.ACCESS_STREAMING);
                      FileOutputStream out = new FileOutputStream(tmp)) {
                     int n;
                     long sinceReport = 0;
@@ -173,6 +208,7 @@ public final class ModelStore {
                     }
                     out.getFD().sync();
                 }
+                dst.delete();
                 if (!tmp.renameTo(dst)) {
                     throw new IOException("无法写入：" + dst);
                 }
@@ -180,8 +216,22 @@ public final class ModelStore {
                 progress.onProgress("已写入 " + (copied / 1024 / 1024) + " MB（已完成 " + done + " / " + total + " 个文件）");
             }
         }
-        try (OutputStream out = new FileOutputStream(new File(modelRoot, "VERSION"))) {
+        try (OutputStream out = new FileOutputStream(new File(modelRoot, VERSION_FILE))) {
             out.write((version + "\n").getBytes(StandardCharsets.UTF_8));
+        }
+        new File(modelRoot, PARTIAL_FILE).delete();
+    }
+
+    /**
+     * Deletes the extracted copy of every model that this APK no longer contains (for example
+     * after switching from the full to the standard APK), so it does not waste storage.
+     */
+    public static void removeUnbundled(Context c) {
+        for (ModelChoice m : ModelChoice.values()) {
+            File dir = new File(root(c), m.key);
+            if (dir.exists() && !isBundled(c, m)) {
+                deleteRecursively(dir);
+            }
         }
     }
 

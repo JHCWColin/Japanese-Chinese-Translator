@@ -14,20 +14,21 @@
 
 ## 模型
 
-设置页最上方可以**分别为「中→日」和「日→中」选择模型**（默认 OPUS-MT）：
+设置页最上方可以**分别为「中→日」和「日→中」选择模型**（1 GB 设备默认精简版）：
 
 | 模型 | 来源 | 说明 | 解压后体积 |
 |---|---|---|---|
-| OPUS-MT（默认） | [`shun89/opus-mt-ja-zh`](https://huggingface.co/shun89/opus-mt-ja-zh)、[`shun89/opus-mt-zh-ja`](https://huggingface.co/shun89/opus-mt-zh-ja) | Marian base（77M 参数），每个方向一个模型，又快又省内存 | ~290 MB |
+| OPUS-MT 精简版（默认） | [`shun89/opus-mt-ja-zh`](https://huggingface.co/shun89/opus-mt-ja-zh)、[`shun89/opus-mt-zh-ja`](https://huggingface.co/shun89/opus-mt-zh-ja) | 同一 Marian base 裁剪低频词表，适合 1 GB 内存设备 | ~175 MB |
+| OPUS-MT（标准版） | 同上 | Marian base（77M 参数），每个方向一个模型，词表完整 | ~290 MB |
 | M2M100 | [`facebook/m2m100_418M`](https://huggingface.co/facebook/m2m100_418M)（MIT） | 4.18 亿参数多语种模型，两个方向共用一份，更聪明 | ~0.5 GB |
 | NLLB-200 | [`facebook/nllb-200-distilled-600M`](https://huggingface.co/facebook/nllb-200-distilled-600M)（CC BY-NC 4.0，仅限非商业） | 6 亿参数多语种模型，质量最高，也最慢最耗内存 | ~0.7 GB |
 
 说明：
 
-- OPUS-MT 是体积足够小且真正的日↔中直译模型（Helsinki-NLP 官方没有 ja→zh；`opus-mt-tc-big-zh-ja` 只有一个方向且质量一般）。动态 int8 量化后每个方向约 **146 MB**。
+- OPUS-MT 是体积足够小且真正的日↔中直译模型（Helsinki-NLP 官方没有 ja→zh；`opus-mt-tc-big-zh-ja` 只有一个方向且质量一般）。动态 int8 量化后标准版每个方向约 **146 MB**，精简版约 **90 MB**。
 - M2M100 / NLLB 的词表很大（12.8 万 / 25.6 万），`tools/prepare_models.py` 会在导出前把词表裁剪到汉字、假名、ASCII 与常用符号（嵌入矩阵、SentencePiece 模型、`vocab.txt` 一并改写），再做 int8 量化，以降低内存占用并加快输出层。
 - 多语种模型通过语言标记工作：原文前加源语言标记，解码器首个词强制为目标语言标记。
-- 三个模型都内置在 APK 里（APK 约 1.4 GB），**只有第一次使用某个模型时才解压它**；每个模型只在用到时才加载。
+- 四个模型都内置在 APK 里（标准安装包含 OPUS-MT、精简版和 M2M100；完整安装包再加入 NLLB-200），**只有第一次使用某个模型时才解压它**；每个模型只在用到时才加载。
 - 1 GB 内存的设备上，M2M100 / NLLB 会很吃紧（建议保持「省内存」模式、质量选「快速」）；它们的实机表现尚未验证。
 
 推理使用 **ONNX Runtime**（Android 版）；分词是纯 Java 重新实现的 SentencePiece（BPE + `nmt_nfkc` 归一化），已与官方库对拍一致。解码为带 KV 缓存的束搜索（快速 / 均衡 / 精准 = 束宽 1 / 2 / 4）。
@@ -39,7 +40,7 @@
 在 [Releases](https://github.com/JHCWColin/Japanese-Chinese-Translator/releases) 下载 `JapaneseChineseTranslator-v*.apk` 并安装。
 
 - 系统：Android 8.0+（目标设备 Android 8.1），ARM 32 位或 64 位
-- 首次使用某个模型时会把它解压到应用私有目录（OPUS-MT 约 290 MB，M2M100 / NLLB 各约 0.5 / 0.7 GB，仅一次）。请按用到的模型预留存储（安装包本身约 1.4 GB）
+- 首次使用某个模型时会把它解压到应用私有目录（精简 OPUS-MT 约 175 MB、标准版约 290 MB，M2M100 / NLLB 各约 0.5 / 0.7 GB，仅一次）。请按用到的模型预留存储
 - 升级时请安装同一发布渠道的 APK（签名一致才能覆盖安装并保留历史）
 
 ### 内存说明（1 GB 设备）

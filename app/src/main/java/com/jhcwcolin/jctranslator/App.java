@@ -3,12 +3,21 @@ package com.jhcwcolin.jctranslator;
 import android.app.Application;
 import android.content.ComponentCallbacks2;
 
+import com.jhcwcolin.jctranslator.engine.ModelStore;
+
 public class App extends Application {
 
     @Override
     public void onCreate() {
         super.onCreate();
         Prefs.init(this);
+        final App app = this;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                ModelStore.removeUnbundled(app);
+            }
+        }, "model-cleanup").start();
     }
 
     @Override

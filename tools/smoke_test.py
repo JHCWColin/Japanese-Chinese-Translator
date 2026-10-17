@@ -7,7 +7,7 @@ It mirrors what MarianTranslator.java does on the device, so it doubles as a
 build-time sanity check: if the quantised models do not translate sensibly the
 CI build fails instead of shipping a broken APK.
 
-    python tools/smoke_test.py app/src/main/assets/models [opus-mt|m2m100|nllb]
+    python tools/smoke_test.py app/src/main/assets/models [opus-mt|opus-lite|m2m100|nllb]
 """
 import sys
 from pathlib import Path
@@ -123,11 +123,12 @@ def _check(label, m, direction, failures):
 def run(models_dir, only=None, verbose_io=True):
     models_dir = Path(models_dir)
     failures = []
-    if only in (None, "opus-mt"):
-        for name in SAMPLES:
-            d = models_dir / "opus-mt" / name
-            if d.exists():
-                _check("opus-mt " + name, Model(d), name, failures)
+    for key in ("opus-mt", "opus-lite"):
+        if only in (None, key):
+            for name in SAMPLES:
+                d = models_dir / key / name
+                if d.exists():
+                    _check("%s %s" % (key, name), Model(d), name, failures)
     for key, pairs in LANG_TOKENS.items():
         if only not in (None, key) or not (models_dir / key).exists():
             continue

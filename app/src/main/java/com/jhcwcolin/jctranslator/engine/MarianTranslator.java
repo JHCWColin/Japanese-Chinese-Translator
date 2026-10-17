@@ -5,12 +5,11 @@ import ai.onnxruntime.OrtEnvironment;
 import ai.onnxruntime.OrtException;
 import ai.onnxruntime.OrtSession;
 
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
@@ -49,23 +48,30 @@ public final class MarianTranslator implements AutoCloseable {
     /** Output of the encoder for one text segment. */
     public static final class Encoded {
         final int srcLen;
-        final float[] hidden; // [srcLen * dModel]
+        float[] hidden; // [srcLen * dModel]
 
         Encoded(int srcLen, float[] hidden) {
             this.srcLen = srcLen;
             this.hidden = hidden;
         }
+
+        /** Releases the encoder output after the decoder has consumed it. */
+        public void release() {
+            hidden = null;
+        }
     }
 
-    private static final int MAX_SOURCE_TOKENS = 400;
+    // Long inputs are split before reaching the engine. Capping a single piece bounds the
+    // encoder output and decoder cross-attention cache on 32-bit devices.
+    private static final int MAX_SOURCE_TOKENS = 256;
     private static final double LENGTH_PENALTY = 1.0;
 
     private final File dir;
     private final int threads;
     private final SentencePieceModel srcSpm;
     private final SentencePieceModel tgtSpm;
-    private final String[] vocab;
-    private final HashMap<String, Integer> vocabIndex = new HashMap<>(1 << 17);
+    /** id -> token, as one compact char array (no per-token String objects). */
+    private final StringTable vocab;
 
     private final int unkId;
     private final int eosId;
@@ -91,6 +97,11 @@ public final class MarianTranslator implements AutoCloseable {
 
     private volatile boolean cancelled;
 
+    // Direct buffers reused between decoding steps / segments (freed with the decoder session).
+    private FloatBuffer[] selfPool;
+    private FloatBuffer[] crossPool;
+    private float[] logitRow;
+
     /** Language tokens of multilingual models (-1 = not used). */
     private int srcLangId = -1;
     private int tgtLangId = -1;
@@ -112,30 +123,46 @@ public final class MarianTranslator implements AutoCloseable {
         maxLength = Integer.parseInt(meta.getProperty("max_length", "512"));
         dModel = heads * headDim;
 
-        List<String> tokens = new ArrayList<>(66000);
-        try (BufferedReader br = new BufferedReader(
-                new InputStreamReader(new FileInputStream(new File(dir, "vocab.txt")), StandardCharsets.UTF_8), 1 << 16)) {
-            String line;
-            while ((line = br.readLine()) != null) {
-                tokens.add(line);
-            }
-        }
-        vocab = tokens.toArray(new String[0]);
-        for (int i = 0; i < vocab.length; i++) {
-            if (!vocabIndex.containsKey(vocab[i])) {
-                vocabIndex.put(vocab[i], i);
-            }
-        }
-        Integer unk = vocabIndex.get("<unk>");
-        unkId = unk != null ? unk : 1;
+        vocab = loadVocab(new File(dir, "vocab.txt"), Integer.parseInt(meta.getProperty("vocab_size", "66000")));
+        int unk = vocab.find("<unk>");
+        unkId = unk >= 0 ? unk : 1;
 
-        try (InputStream in = new FileInputStream(new File(dir, "source.spm"))) {
-            srcSpm = SentencePieceModel.load(in);
-        }
+        srcSpm = SentencePieceModel.load(new File(dir, "source.spm"));
         File tgtFile = new File(dir, "target.spm");
-        try (InputStream in = new FileInputStream(tgtFile.isFile() ? tgtFile : new File(dir, "source.spm"))) {
-            tgtSpm = SentencePieceModel.load(in);
+        // Multilingual models ship one SentencePiece model for both sides: do not parse it twice.
+        tgtSpm = tgtFile.isFile() ? SentencePieceModel.load(tgtFile) : srcSpm;
+    }
+
+    /** Reads vocab.txt (one token per line, line number = id) straight into a {@link StringTable}. */
+    private static StringTable loadVocab(File file, int expected) throws IOException {
+        long length = file.length();
+        if (length <= 0 || length > (64L << 20)) {
+            throw new IOException("Bad vocabulary file: " + file);
         }
+        byte[] data = new byte[(int) length];
+        try (FileInputStream in = new FileInputStream(file)) {
+            int off = 0;
+            while (off < data.length) {
+                int r = in.read(data, off, data.length - off);
+                if (r < 0) {
+                    throw new IOException("Unexpected end of " + file);
+                }
+                off += r;
+            }
+        }
+        StringTable.Builder b = new StringTable.Builder(expected + 16, expected * 3);
+        int start = 0;
+        for (int i = 0; i < data.length; i++) {
+            if (data[i] == '\n') {
+                int end = i > start && data[i - 1] == '\r' ? i - 1 : i;
+                b.addUtf8(data, start, end);
+                start = i + 1;
+            }
+        }
+        if (start < data.length) {
+            b.addUtf8(data, start, data.length);
+        }
+        return b.build();
     }
 
     /**
@@ -151,8 +178,7 @@ public final class MarianTranslator implements AutoCloseable {
         if (token == null) {
             return -1;
         }
-        Integer id = vocabIndex.get(token);
-        return id != null ? id : -1;
+        return vocab.find(token);
     }
 
     public void cancel() {
@@ -173,22 +199,66 @@ public final class MarianTranslator implements AutoCloseable {
     // Sessions
     // ---------------------------------------------------------------------------------------
 
+    /**
+     * Marker file written while a session is being created. If the process dies natively in the
+     * middle of that (a crash cannot be caught in Java), the marker survives and the next attempt
+     * uses the most conservative settings. Content: the optimisation level that was attempted.
+     */
+    private File loadMarker() {
+        return new File(dir, ".loading");
+    }
+
     private OrtSession openSession(String file) throws OrtException {
         if (env == null) {
             env = OrtEnvironment.getEnvironment();
         }
+        File marker = loadMarker();
+        boolean safeMode = marker.exists();
+        if (safeMode && readMarker(marker).equals("none")) {
+            marker.delete();
+            throw new OrtException("上次加载此模型时应用意外退出（内存不足或推理库异常）。请关闭其他应用后重试，"
+                    + "或在设置中改用更小的模型（如 OPUS-MT 精简版）。");
+        }
+        writeMarker(marker, safeMode ? "none" : "basic");
+
         OrtSession.SessionOptions so = new OrtSession.SessionOptions();
         try {
             so.setIntraOpNumThreads(threads);
             so.setInterOpNumThreads(1);
             so.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL);
-            so.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.BASIC_OPT);
+            so.setOptimizationLevel(safeMode ? OrtSession.SessionOptions.OptLevel.NO_OPT
+                    : OrtSession.SessionOptions.OptLevel.BASIC_OPT);
+            // ORT 1.22 on 32-bit ARM: the CommonSubexpressionElimination graph pass hashes scalar
+            // initialisers with an 8-byte load (ldrd) from an odd address (libc++ short-string
+            // storage) -> SIGBUS while the session is created. Measured on an armv7 device.
+            so.addConfigEntry("optimization.disable_specified_optimizers", "CommonSubexpressionElimination");
             so.setMemoryPatternOptimization(false);
             so.setCPUArenaAllocator(false);
             so.addConfigEntry("session.intra_op.allow_spinning", "0");
-            return env.createSession(new File(dir, file).getAbsolutePath(), so);
+            OrtSession session = env.createSession(new File(dir, file).getAbsolutePath(), so);
+            marker.delete();
+            return session;
         } finally {
             so.close();
+        }
+    }
+
+    private static String readMarker(File f) {
+        try (InputStream in = new FileInputStream(f)) {
+            byte[] b = new byte[16];
+            int n = in.read(b);
+            return n > 0 ? new String(b, 0, n, StandardCharsets.UTF_8).trim() : "";
+        } catch (IOException e) {
+            return "";
+        }
+    }
+
+    private static void writeMarker(File f, String content) {
+        try (FileOutputStream out = new FileOutputStream(f)) {
+            out.write(content.getBytes(StandardCharsets.UTF_8));
+            out.getFD().sync();
+        } catch (IOException ignored) {
+            // without the marker we simply lose the crash fallback
         }
     }
 
@@ -274,6 +344,9 @@ public final class MarianTranslator implements AutoCloseable {
             }
             decoderSession = null;
         }
+        selfPool = null;
+        crossPool = null;
+        logitRow = null;
     }
 
     @Override
@@ -299,8 +372,8 @@ public final class MarianTranslator implements AutoCloseable {
             ids[0] = srcLangId;
         }
         for (int i = 0; i < n; i++) {
-            Integer id = vocabIndex.get(pieces.get(i));
-            ids[lead + i] = id != null ? id : unkId;
+            int id = vocab.find(pieces.get(i));
+            ids[lead + i] = id >= 0 ? id : unkId;
         }
         ids[lead + n] = eosId; // Marian expects </s> at the end of the source
         return ids;
@@ -309,10 +382,10 @@ public final class MarianTranslator implements AutoCloseable {
     private String detokenize(List<Integer> tokens) {
         List<String> pieces = new ArrayList<>(tokens.size());
         for (int t : tokens) {
-            if (t == eosId || t == padId || t == unkId || t == tgtLangId || t < 0 || t >= vocab.length) {
+            if (t == eosId || t == padId || t == unkId || t == tgtLangId || t < 0 || t >= vocab.size()) {
                 continue;
             }
-            pieces.add(vocab[t]);
+            pieces.add(vocab.get(t));
         }
         return tgtSpm.decodePieces(pieces);
     }
@@ -401,8 +474,14 @@ public final class MarianTranslator implements AutoCloseable {
      * Copies batch rows of {@code src} ([bOld, blockSize] floats) into a new buffer of
      * {@code parents.length} rows: row j of the result is row parents[j] of src.
      */
-    private static FloatBuffer gather(FloatBuffer src, int[] parents, int blockSize) {
-        FloatBuffer dst = directFloats(parents.length * blockSize);
+    private static FloatBuffer gather(FloatBuffer[] pool, int slot, FloatBuffer src, int[] parents, int blockSize) {
+        int need = parents.length * blockSize;
+        FloatBuffer dst = pool[slot];
+        if (dst == null || dst.capacity() < need) {
+            dst = directFloats(need + (need >> 2) + 64);   // 25 % slack: the cache grows by one position per step
+            pool[slot] = dst;
+        }
+        dst.clear();
         FloatBuffer s = src.duplicate();
         for (int j = 0; j < parents.length; j++) {
             s.limit((parents[j] + 1) * blockSize);
@@ -422,11 +501,18 @@ public final class MarianTranslator implements AutoCloseable {
     public synchronized String decode(Encoded enc, int numBeams) throws OrtException {
         checkCancelled();
         ensureDecoder();
+        if (enc == null || enc.hidden == null || enc.srcLen <= 0) {
+            return "";
+        }
         final int beams = Math.max(1, numBeams);
         final int s = enc.srcLen;
         final int maxNew = Math.min(Math.min(maxLength, 256), s * 2 + 16);
         final int kvBlock = heads * headDim;
 
+        if (selfPool == null) {
+            selfPool = new FloatBuffer[layers * 2];
+            crossPool = new FloatBuffer[layers * 2];
+        }
         List<OnnxTensor> toClose = new ArrayList<>();
         try {
             // ---- step 0: batch of one, no cache --------------------------------------
@@ -479,7 +565,10 @@ public final class MarianTranslator implements AutoCloseable {
                     int logitDim = lshape.length >= 3 ? (int) lshape[2] : logits.remaining() / (batch * positions);
                     int topK = beams * 2;
                     List<Cand> cands = new ArrayList<>(batch * topK);
-                    float[] row = new float[logitDim];
+                    if (logitRow == null || logitRow.length != logitDim) {
+                        logitRow = new float[logitDim];
+                    }
+                    float[] row = logitRow;
                     for (int b = 0; b < batch; b++) {
                         // only the last position predicts the next token
                         logits.position((b * positions + positions - 1) * logitDim);
@@ -548,7 +637,7 @@ public final class MarianTranslator implements AutoCloseable {
                     int block = heads * newLen * headDim;
                     for (int i = 0; i < layers * 2; i++) {
                         OnnxTensor present = (OnnxTensor) res.get(selfOutIdx[i]);
-                        selfBuf[i] = gather(present.getFloatBuffer(), parents, block);
+                        selfBuf[i] = gather(selfPool, i, present.getFloatBuffer(), parents, block);
                     }
                     if (crossT == null) {
                         crossBatch = nb;
@@ -556,7 +645,7 @@ public final class MarianTranslator implements AutoCloseable {
                         int[] zeros = new int[nb];
                         for (int i = 0; i < layers * 2; i++) {
                             OnnxTensor cp = (OnnxTensor) res.get(crossOutIdx[i]);
-                            FloatBuffer tiled = gather(cp.getFloatBuffer(), zeros, heads * s * headDim);
+                            FloatBuffer tiled = gather(crossPool, i, cp.getFloatBuffer(), zeros, heads * s * headDim);
                             crossT[i] = track(toClose, OnnxTensor.createTensor(env, tiled, new long[]{nb, heads, s, headDim}));
                         }
                         // batch-wide constants for the cache branch

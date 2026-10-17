@@ -5,13 +5,18 @@ plugins {
 // Release signing is configured through environment variables (set by the GitHub workflow).
 def releaseKeystore = System.getenv('KEYSTORE_FILE')
 
-// Version comes from the workflow: -PappVersionName=1.0.0 -PappVersionCode=12
-def appVersionName = (project.findProperty('appVersionName') ?: '1.0.0').toString()
+// Version comes from the workflow: -PappVersionName=1.4.0 -PappVersionCode=...
+def appVersionName = (project.findProperty('appVersionName') ?: '1.4.0').toString()
 def appVersionCode = (project.findProperty('appVersionCode') ?: '1').toString().toInteger()
 
 android {
     namespace 'com.jhcwcolin.jctranslator'
-    compileSdk 34
+    // -PcompileSdkVersion=35 lets a machine that only has a newer platform installed build locally.
+    // Keep the value in a local variable: the AGP Groovy DSL treats a parenthesised
+    // expression after compileSdk as a closure in some Gradle 8.x versions and reports
+    // the rather misleading "Value is null" error.
+    def compileSdkValue = (project.findProperty('compileSdkVersion') ?: '34').toString().toInteger()
+    compileSdk compileSdkValue
 
     defaultConfig {
         applicationId 'com.jhcwcolin.jctranslator'
@@ -59,7 +64,7 @@ android {
 
     // Model files are incompressible int8 weights: store them as-is (faster build, faster first run).
     androidResources {
-        noCompress 'onnx', 'spm', 'txt', 'properties'
+        noCompress 'onnx', 'onnx_data', 'spm', 'txt', 'properties'
     }
 
     packaging {

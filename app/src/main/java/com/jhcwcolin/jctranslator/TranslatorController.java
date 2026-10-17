@@ -1,5 +1,6 @@
 package com.jhcwcolin.jctranslator;
 
+import android.app.ActivityManager;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -192,8 +193,12 @@ public final class TranslatorController {
             this.text = text;
             this.dir = dir;
             this.model = Prefs.model(dir);
-            this.beams = Prefs.beams();
-            this.threads = Prefs.effectiveThreads();
+            // ORT allocates a thread-local scratch arena for every intra-op worker.  Four
+            // workers are reasonable on a desktop but can consume the last few dozen MB on the
+            // target 1 GB/32-bit device.  Low-memory mode therefore also constrains the two
+            // other transient allocations that affect the peak during session creation.
+            this.beams = lowMemory ? Math.min(2, Prefs.beams()) : Prefs.beams();
+            this.threads = lowMemory ? 1 : Prefs.effectiveThreads();
             this.maxChars = Prefs.maxSegmentChars();
             this.lowMemory = lowMemory;
             this.saveHistory = Prefs.historyEnabled();
@@ -228,7 +233,7 @@ public final class TranslatorController {
                 Prefs.setLastDirection(dir);
             }
         }
-        final Job job = new Job(text, dir, Prefs.lowMemory(app));
+        final Job job = new Job(text, dir, Prefs.lowMemory(app, Prefs.model(dir)));
 
         main.removeCallbacks(idleRelease);
         cancelRequested = false;
@@ -382,6 +387,7 @@ public final class TranslatorController {
             final String loadHint = job.lowMemory ? "省内存模式：分步加载，请耐心等待" : "首次加载较慢，请耐心等待";
             if (!t.isEncoderLoaded()) {
                 publish(Phase.LOADING, "正在加载翻译模型（1/2）…", job.dir.label() + " · " + model.title + " · " + loadHint);
+                checkMemoryBeforeSession(model, false);
                 t.loadEncoder();
             }
 
@@ -402,10 +408,15 @@ public final class TranslatorController {
             }
             if (job.lowMemory) {
                 t.closeEncoder();
+                // The native session is gone at this point, but the Java/GC side may still keep
+                // direct buffers alive until the next collection.  Do this before creating the
+                // decoder, where the model weights and KV-cache have their largest peak.
+                System.gc();
             }
 
             if (!t.isDecoderLoaded()) {
                 publish(Phase.LOADING, "正在加载翻译模型（2/2）…", job.dir.label() + " · " + model.title + " · " + loadHint);
+                checkMemoryBeforeSession(model, true);
                 t.loadDecoder();
             }
 
@@ -420,6 +431,11 @@ public final class TranslatorController {
                     }
                     publish(Phase.TRANSLATING, "正在翻译，请稍候…", "翻译第 " + (n + 1) + " / " + total + " 段");
                     parts.add(CjkText.tidy(t.decode(e, job.beams), job.dir.targetIsJapanese()));
+                    // An Encoded object is intentionally retained in the list until its turn so
+                    // the encoder can be closed before the decoder is opened.  Release its large
+                    // hidden-state array immediately after decoding instead of holding every
+                    // segment until the whole document has finished.
+                    e.release();
                     n++;
                 }
                 if (li > 0) {
@@ -454,6 +470,28 @@ public final class TranslatorController {
             return "内存不足：" + m + "。请关闭其他应用，或在设置中选择「省内存」模式。";
         }
         return e.getClass().getSimpleName() + (m == null ? "" : "：" + m);
+    }
+
+    /**
+     * Native ONNX allocation can terminate a 32-bit process without throwing Java OOM. Refuse a
+     * session creation when Android reports too little reclaimable memory, so the user gets a
+     * recoverable message and can close other apps or select the lite model.
+     */
+    private void checkMemoryBeforeSession(ModelChoice model, boolean decoder) throws java.io.IOException {
+        ActivityManager am = (ActivityManager) app.getSystemService(Context.ACTIVITY_SERVICE);
+        if (am == null) {
+            return;
+        }
+        ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
+        am.getMemoryInfo(mi);
+        long modelMb = Math.max(64L, model.weightMb);
+        long required = (decoder ? modelMb + 128L : modelMb / 2L + 96L) * 1024L * 1024L;
+        if (mi.availMem < required) {
+            throw new java.io.IOException("可用内存不足，暂不加载「" + model.title + "」的"
+                    + (decoder ? "解码器" : "编码器") + "（当前约 " + (mi.availMem / 1024 / 1024)
+                    + " MB，需要约 " + (required / 1024 / 1024)
+                    + " MB）。请关闭其他应用或改用 OPUS-MT 精简版。");
+        }
     }
 
     private void finishOk(final Job job, final String translation) {

@@ -93,7 +93,7 @@ public class SettingsActivity extends BaseActivity {
 
     private void buildRows() {
         section(R.drawable.ic_brain, "翻译模型");
-        infoText("中→日 与 日→中 可以分别选择模型。默认的 OPUS-MT 又快又省内存；M2M100 与 NLLB-200 更聪明、译文更通顺、错误更少，"
+        infoText("中→日 与 日→中 可以分别选择模型。1 GB 内存设备默认使用 OPUS-MT 精简版；标准 OPUS-MT 可手动切换。M2M100 与 NLLB-200 更聪明、译文更通顺、错误更少，"
                 + "但体积更大、翻译更慢、占用更多内存（本设备约 " + totalRamMb() + " MB）。"
                 + "第一次使用某个模型时需要花几分钟解压，之后不再需要。");
         modelRow(Direction.ZH_JA);
@@ -279,9 +279,9 @@ public class SettingsActivity extends BaseActivity {
 
         // ---- performance ----
         section(R.drawable.ic_gauge, "性能与内存");
-        boolean low = Prefs.lowMemory(this);
+        boolean low = Prefs.lowMemory(this, Prefs.model(Direction.JA_ZH)) || Prefs.lowMemory(this, Prefs.model(Direction.ZH_JA));
         choiceRow(R.drawable.ic_memory_stick, "内存模式", "设备总内存 " + totalRamMb() + " MB，当前实际使用：" + (low ? "省内存" : "常驻")
-                        + "。\n自动=内存小于 2 GB 时用省内存。省内存：编码器与解码器分步加载以降低峰值内存，空闲 45 秒后自动释放；常驻：两者都留在内存里，翻译更快但占用更多。",
+                        + "。\n自动=当前可用内存放不下编码器与解码器时用省内存。省内存：编码器与解码器分步加载以降低峰值内存，空闲 45 秒后自动释放；常驻：两者都留在内存里，翻译更快但占用更多。",
                 new String[]{"自动", "省内存", "常驻"}, Prefs.memoryMode(), new IntCallback() {
                     @Override
                     public void on(int v) {
@@ -364,6 +364,7 @@ public class SettingsActivity extends BaseActivity {
                 + "完全离线的日语 ⇄ 中文翻译，翻译模型已内置在安装包中，不需要联网，也不会上传任何文字。\n\n"
                 + "翻译模型（可在最上方分别为两个方向选择）：\n"
                 + "· OPUS-MT（Marian）日→中 / 中→日 直译模型，int8 量化，每个方向约 146 MB。来源 shun89/opus-mt-ja-zh、shun89/opus-mt-zh-ja（基于 Helsinki-NLP OPUS-MT，CC BY 4.0 / Apache-2.0）。\n"
+                + "· OPUS-MT 精简版：同一批模型裁掉用不到的词表（约一半），其余结构不变，体积与内存占用约减半。\n"
                 + "· M2M100 418M（Facebook/Meta，MIT），int8 量化并裁剪词表。\n"
                 + "· NLLB-200 distilled 600M（Meta，CC BY-NC 4.0，仅限非商业使用），int8 量化并裁剪词表。\n"
                 + "推理引擎：ONNX Runtime（MIT）。\n"
@@ -374,7 +375,7 @@ public class SettingsActivity extends BaseActivity {
     private void modelRow(final Direction d) {
         LinearLayout b = block(R.drawable.ic_languages, d.label() + " 使用的模型", null);
         ModelChoice cur = Prefs.model(d);
-        for (final ModelChoice m : ModelChoice.values()) {
+        for (final ModelChoice m : ModelChoice.LIST_ORDER) {
             boolean bundled = ModelStore.isBundled(this, m);
             String text = m.title + "　" + m.size + "\n" + m.desc + (bundled ? "" : "（本安装包未包含）");
             TextView btn = Ui.button(this, text, Prefs.uiSizeSp(), new View.OnClickListener() {

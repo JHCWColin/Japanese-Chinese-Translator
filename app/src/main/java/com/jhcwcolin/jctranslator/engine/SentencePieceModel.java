@@ -1,11 +1,12 @@
 package com.jhcwcolin.jctranslator.engine;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 
 /**
@@ -28,7 +29,11 @@ public final class SentencePieceModel {
     private static final int TYPE_USER_DEFINED = 4;
     private static final int TYPE_UNUSED = 5;
 
-    private final HashMap<String, Float> pieceScore = new HashMap<>(1 << 17);
+    // Pieces and their scores in primitive arrays (about 1.4 MB for a 65k-piece model).
+    private final StringTable.Builder pieceBuilder = new StringTable.Builder(70000, 200000);
+    private float[] scoreBuf = new float[70000];
+    private StringTable pieces;
+    private float[] scores;
     private int maxPieceChars = 1;
     private float minScore = Float.MAX_VALUE;
 
@@ -50,6 +55,26 @@ public final class SentencePieceModel {
     // ---------------------------------------------------------------------------------------
     // Loading
     // ---------------------------------------------------------------------------------------
+
+    /** Loads a model file; the file is read into a single exactly-sized array. */
+    public static SentencePieceModel load(File file) throws IOException {
+        long length = file.length();
+        if (length <= 0 || length > (64L << 20)) {
+            throw new IOException("Bad SentencePiece model size: " + file);
+        }
+        byte[] data = new byte[(int) length];
+        try (FileInputStream in = new FileInputStream(file)) {
+            int off = 0;
+            while (off < data.length) {
+                int r = in.read(data, off, data.length - off);
+                if (r < 0) {
+                    throw new IOException("Unexpected end of " + file);
+                }
+                off += r;
+            }
+        }
+        return parse(data);
+    }
 
     public static SentencePieceModel load(InputStream in) throws IOException {
         ByteArrayOutputStream bos = new ByteArrayOutputStream(1 << 21);
@@ -83,14 +108,19 @@ public final class SentencePieceModel {
                 top.skip(wire);
             }
         }
-        if (m.pieceScore.isEmpty()) {
+        if (m.pieceBuilder.size() == 0) {
             throw new IOException("SentencePiece model has no pieces");
         }
+        m.pieces = m.pieceBuilder.build();
+        m.scores = java.util.Arrays.copyOf(m.scoreBuf, m.pieces.size());
+        m.scoreBuf = null;
+        m.maxPieceChars = Math.max(1, m.pieces.maxLength());
         return m;
     }
 
     private void parsePiece(Reader r) {
-        String piece = null;
+        int pieceFrom = -1;
+        int pieceTo = -1;
         float score = 0f;
         int type = TYPE_NORMAL;
         while (r.hasMore()) {
@@ -99,7 +129,8 @@ public final class SentencePieceModel {
             int wire = tag & 7;
             if (field == 1 && wire == 2) {
                 int len = (int) r.varint();
-                piece = new String(r.b, r.pos, len, StandardCharsets.UTF_8);
+                pieceFrom = r.pos;
+                pieceTo = r.pos + len;
                 r.pos += len;
             } else if (field == 2 && wire == 5) {
                 int bits = (r.b[r.pos] & 0xff) | ((r.b[r.pos + 1] & 0xff) << 8)
@@ -112,16 +143,17 @@ public final class SentencePieceModel {
                 r.skip(wire);
             }
         }
-        if (piece == null || piece.isEmpty()) {
+        if (pieceFrom < 0 || pieceTo <= pieceFrom) {
             return;
         }
         if (type == TYPE_UNKNOWN || type == TYPE_CONTROL || type == TYPE_UNUSED) {
             return; // never produced by segmentation
         }
-        pieceScore.put(piece, score);
-        if (piece.length() > maxPieceChars) {
-            maxPieceChars = piece.length();
+        int index = pieceBuilder.addUtf8(r.b, pieceFrom, pieceTo);
+        if (index >= scoreBuf.length) {
+            scoreBuf = java.util.Arrays.copyOf(scoreBuf, scoreBuf.length + (scoreBuf.length >> 1) + 16);
         }
+        scoreBuf[index] = score;
         if (type == TYPE_NORMAL && score < minScore) {
             minScore = score;
         }
@@ -415,16 +447,22 @@ public final class SentencePieceModel {
         }
     }
 
-    private void maybeAddPair(java.util.PriorityQueue<SymbolPair> agenda, String[] piece, int left, int right) {
+    private void maybeAddPair(java.util.PriorityQueue<SymbolPair> agenda, String[] piece, int left, int right, char[] scratch) {
         if (left < 0 || right < 0) {
             return;
         }
-        String merged = piece[left] + piece[right];
-        Float sc = pieceScore.get(merged);
-        if (sc == null) {
+        int ll = piece[left].length();
+        int rl = piece[right].length();
+        if (ll + rl > maxPieceChars) {
             return;
         }
-        agenda.add(new SymbolPair(left, right, sc, merged.length()));
+        piece[left].getChars(0, ll, scratch, 0);
+        piece[right].getChars(0, rl, scratch, ll);
+        int idx = pieces.find(scratch, 0, ll + rl);
+        if (idx < 0) {
+            return;
+        }
+        agenda.add(new SymbolPair(left, right, scores[idx], ll + rl));
     }
 
     private List<String> encodeBpe(String s) {
@@ -450,8 +488,9 @@ public final class SentencePieceModel {
                 return Integer.compare(a.left, b.left);      // then leftmost
             }
         });
+        char[] scratch = new char[2 * maxPieceChars + 2];
         for (int i = 1; i < n; i++) {
-            maybeAddPair(agenda, piece, i - 1, i);
+            maybeAddPair(agenda, piece, i - 1, i, scratch);
         }
         while (!agenda.isEmpty()) {
             SymbolPair top = agenda.poll();
@@ -466,8 +505,8 @@ public final class SentencePieceModel {
                 prev[next[top.right]] = top.left;
             }
             piece[top.right] = "";
-            maybeAddPair(agenda, piece, prev[top.left], top.left);
-            maybeAddPair(agenda, piece, top.left, next[top.left]);
+            maybeAddPair(agenda, piece, prev[top.left], top.left, scratch);
+            maybeAddPair(agenda, piece, top.left, next[top.left], scratch);
         }
         List<String> result = new ArrayList<>();
         for (int i = 0; i != -1; i = next[i]) {
@@ -481,6 +520,7 @@ public final class SentencePieceModel {
     private List<String> encodeUnigram(String s) {
         List<String> result = new ArrayList<>();
         int n = s.length();
+        char[] sc = s.toCharArray();
         float unkScore = minScore - UNK_PENALTY;
         float[] best = new float[n + 1];
         int[] startsAt = new int[n + 1];
@@ -497,9 +537,9 @@ public final class SentencePieceModel {
                 if (end - i > maxPieceChars) {
                     break;
                 }
-                Float sc = pieceScore.get(s.substring(i, end));
-                if (sc != null) {
-                    float cand = base + sc;
+                int idx = pieces.find(sc, i, end);
+                if (idx >= 0) {
+                    float cand = base + scores[idx];
                     if (startsAt[end] == -1 || cand > best[end]) {
                         best[end] = cand;
                         startsAt[end] = i;

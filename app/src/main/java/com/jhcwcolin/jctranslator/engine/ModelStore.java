@@ -33,6 +33,14 @@ public final class ModelStore {
     private static final String[] FILES = {
             "encoder.onnx", "decoder.onnx", "source.spm", "target.spm", "vocab.txt", "meta.properties"
     };
+    /** Multilingual models share one SentencePiece model, so they ship without target.spm. */
+    private static final String[] FILES_MULTILINGUAL = {
+            "encoder.onnx", "decoder.onnx", "source.spm", "vocab.txt", "meta.properties"
+    };
+
+    private static String[] filesOf(ModelChoice m) {
+        return m.multilingual ? FILES_MULTILINGUAL : FILES;
+    }
     /** Free space kept in reserve on top of the files being written. */
     private static final long HEADROOM_BYTES = 120L * 1024 * 1024;
 
@@ -94,7 +102,7 @@ public final class ModelStore {
                 return false;
             }
             for (Direction d : directions(m)) {
-                for (String f : FILES) {
+                for (String f : filesOf(m)) {
                     if (!new File(dirFor(c, m, d), f).isFile()) {
                         return false;
                     }
@@ -128,7 +136,7 @@ public final class ModelStore {
         }
         long need = HEADROOM_BYTES;
         for (Direction d : directions(m)) {
-            for (String name : FILES) {
+            for (String name : filesOf(m)) {
                 need += assetSize(c, assetPath(m, d, name));
             }
         }
@@ -138,7 +146,7 @@ public final class ModelStore {
                     + "当前仅剩 " + (fs.getAvailableBytes() / 1024 / 1024) + " MB。请清理后重试。");
         }
 
-        int total = directions(m).size() * FILES.length;
+        int total = directions(m).size() * filesOf(m).length;
         int done = 0;
         long copied = 0;
         byte[] buf = new byte[256 * 1024];
@@ -147,7 +155,7 @@ public final class ModelStore {
             if (!dir.mkdirs() && !dir.isDirectory()) {
                 throw new IOException("无法创建目录：" + dir);
             }
-            for (String name : FILES) {
+            for (String name : filesOf(m)) {
                 File tmp = new File(dir, name + ".tmp");
                 File dst = new File(dir, name);
                 try (InputStream in = c.getAssets().open(assetPath(m, d, name));

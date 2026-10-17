@@ -222,6 +222,10 @@ public class MainActivity extends BaseActivity implements TranslatorController.L
             input.setMinLines(1);
             input.setHint("输入要翻译的文字");
             btnSwap.setText(ctl.direction.label());
+            // these buttons were already added to the normal-mode rows; a view can have one parent only
+            for (View v : new View[]{btnSwap, btnClear, btnStop, btnTranslate}) {
+                ((ViewGroup) v.getParent()).removeView(v);
+            }
             LinearLayout bar = Ui.row(c);
             bar.addView(btnSwap, Ui.lpMargins(0, WRAP, 1.3f, 0, 0, gap, 0));
             bar.addView(btnClear, Ui.lpMargins(0, WRAP, 1f, 0, 0, gap, 0));

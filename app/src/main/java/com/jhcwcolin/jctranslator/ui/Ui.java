@@ -46,6 +46,7 @@ public final class Ui {
         GradientDrawable d = new GradientDrawable();
         d.setShape(GradientDrawable.RECTANGLE);
         d.setColor(fill);
+        d.setCornerRadius(dp(c, Prefs.cornerDp()));
         int w = Math.max(1, dp(c, strokeDp));
         if (dashed) {
             d.setStroke(w, stroke, dp(c, 6), dp(c, 4));
@@ -62,10 +63,10 @@ public final class Ui {
 
     private static StateListDrawable buttonBackground(Context c) {
         StateListDrawable s = new StateListDrawable();
-        s.addState(new int[]{-android.R.attr.state_enabled}, box(c, bg(), fg(), 2, true));
-        s.addState(new int[]{android.R.attr.state_pressed}, box(c, fg(), fg(), 2, false));
-        s.addState(new int[]{android.R.attr.state_selected}, box(c, fg(), fg(), 2, false));
-        s.addState(new int[0], box(c, bg(), fg(), 2, false));
+        s.addState(new int[]{-android.R.attr.state_enabled}, box(c, bg(), fg(), Prefs.borderDp(), true));
+        s.addState(new int[]{android.R.attr.state_pressed}, box(c, fg(), fg(), Prefs.borderDp(), false));
+        s.addState(new int[]{android.R.attr.state_selected}, box(c, fg(), fg(), Prefs.borderDp(), false));
+        s.addState(new int[0], box(c, bg(), fg(), Prefs.borderDp(), false));
         return s;
     }
 
@@ -88,7 +89,7 @@ public final class Ui {
         t.setTextColor(buttonTextColors());
         t.setBackground(buttonBackground(c));
         t.setPadding(dp(c, 12), dp(c, 8), dp(c, 12), dp(c, 8));
-        t.setMinHeight(dp(c, 52));
+        t.setMinHeight(dp(c, Prefs.buttonHeightDp()));
         t.setMinWidth(dp(c, 64));
         t.setClickable(true);
         t.setFocusable(true);
@@ -111,7 +112,7 @@ public final class Ui {
         e.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
         e.setTextColor(fg());
         e.setHintTextColor(hint());
-        e.setBackground(panel(c, 2));
+        e.setBackground(panel(c, Prefs.borderDp()));
         e.setPadding(dp(c, 10), dp(c, 8), dp(c, 10), dp(c, 8));
         e.setGravity(Gravity.TOP | Gravity.START);
         e.setLineSpacing(0, Prefs.lineSpacing());

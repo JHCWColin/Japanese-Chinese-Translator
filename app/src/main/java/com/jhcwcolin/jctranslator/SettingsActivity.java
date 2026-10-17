@@ -89,6 +89,62 @@ public class SettingsActivity extends BaseActivity {
     }
 
     private void buildRows() {
+        section("个性化");
+        switchRow("纯净模式", "主界面只保留一个输入框，旁边是方向切换与翻译按钮；点「翻译」后译文直接替换框内内容。", Prefs.pureMode(), new BoolCallback() {
+            @Override
+            public void on(boolean v) {
+                Prefs.setPureMode(v);
+                changed();
+            }
+        });
+        choiceRow("原文/译文排布", "「自动」竖屏上下排布、横屏左右排布。纯净模式下无效。",
+                new String[]{"自动", "上下排布", "左右排布"}, Prefs.boxLayout(), new IntCallback() {
+                    @Override
+                    public void on(int v) {
+                        Prefs.setBoxLayout(v);
+                        changed();
+                    }
+                });
+        choiceRow("按钮圆角", "方角在墨水屏上最清晰；圆角更柔和。",
+                new String[]{"方角", "小圆角", "大圆角"}, Prefs.cornerIndex(), new IntCallback() {
+                    @Override
+                    public void on(int v) {
+                        Prefs.setCornerIndex(v);
+                        changed();
+                    }
+                });
+        choiceRow("边框粗细", "按钮与文本框的边框。",
+                new String[]{"极细", "细", "中", "粗"}, Prefs.borderIndex(), new IntCallback() {
+                    @Override
+                    public void on(int v) {
+                        Prefs.setBorderIndex(v);
+                        changed();
+                    }
+                });
+        choiceRow("按钮高度", "按钮越高越容易点按。",
+                new String[]{"紧凑", "标准", "较高", "很高"}, Prefs.buttonHeightIndex(), new IntCallback() {
+                    @Override
+                    public void on(int v) {
+                        Prefs.setButtonHeightIndex(v);
+                        changed();
+                    }
+                });
+        choiceRow("全局字体缩放", "同时缩放所有文字（含界面字号与输入译文字号）。",
+                new String[]{"80%", "90%", "100%", "110%", "125%", "150%"}, Prefs.fontScaleIndex(), new IntCallback() {
+                    @Override
+                    public void on(int v) {
+                        Prefs.setFontScaleIndex(v);
+                        changed();
+                    }
+                });
+        switchRow("显示状态栏", "主界面显示翻译状态与提示信息；关闭后更简洁。", Prefs.showStatus(), new BoolCallback() {
+            @Override
+            public void on(boolean v) {
+                Prefs.setShowStatus(v);
+                changed();
+            }
+        });
+
         // ---- display ----
         section("显示");
         choiceRow("屏幕方向", "选择应用的显示方向。选「跟随系统」时由设备的旋转设置决定。",

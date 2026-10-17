@@ -42,6 +42,8 @@ public class MainActivity extends BaseActivity implements TranslatorController.L
     private ScrollView resultScroll;
     private TextView resultView;
     private boolean inputLocked;
+    /** Pure mode: after a translation finishes, its result replaces the text in the input box. */
+    private boolean pendingPure;
     /** Last draft text we pushed to / read from the input, so user typing is never overwritten. */
     private String shownDraft;
 
@@ -63,7 +65,9 @@ public class MainActivity extends BaseActivity implements TranslatorController.L
         final Context c = this;
         final int ui = Prefs.uiSizeSp();
         final int txt = Prefs.textSizeSp();
-        final boolean landscape = getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
+        final boolean deviceLandscape = getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
+        final boolean landscape = Prefs.boxLayout() == Prefs.LAYOUT_AUTO ? deviceLandscape
+                : Prefs.boxLayout() == Prefs.LAYOUT_SIDE;
         final int gap = Ui.dp(c, 8);
         final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
         final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
@@ -214,6 +218,25 @@ public class MainActivity extends BaseActivity implements TranslatorController.L
         resultActions.addView(pageDown, Ui.lp(0, WRAP, 1f));
 
         // ---- assemble ----
+        if (Prefs.pureMode()) {
+            input.setMinLines(1);
+            input.setHint("输入要翻译的文字");
+            btnSwap.setText(ctl.direction.label());
+            LinearLayout bar = Ui.row(c);
+            bar.addView(btnSwap, Ui.lpMargins(0, WRAP, 1.3f, 0, 0, gap, 0));
+            bar.addView(btnClear, Ui.lpMargins(0, WRAP, 1f, 0, 0, gap, 0));
+            bar.addView(btnStop, Ui.lpMargins(0, WRAP, 1f, 0, 0, gap, 0));
+            bar.addView(btnTranslate, Ui.lp(0, WRAP, 1.5f));
+            root.addView(input, Ui.lpMargins(MATCH, 0, 1f, 0, 0, 0, gap));
+            root.addView(bar, Ui.lpMargins(MATCH, WRAP, 0, 0, 0, 0, gap));
+            if (Prefs.showStatus()) {
+                root.addView(statusBox, Ui.lp(MATCH, WRAP));
+            }
+            return;
+        }
+        if (!Prefs.showStatus()) {
+            statusBox.setVisibility(View.GONE);
+        }
         if (landscape) {
             LinearLayout body = Ui.row(c);
             body.setGravity(Gravity.TOP);
@@ -261,6 +284,7 @@ public class MainActivity extends BaseActivity implements TranslatorController.L
         if (Prefs.autoHideKeyboard()) {
             hideKeyboardNow();
         }
+        pendingPure = Prefs.pureMode() && !text.trim().isEmpty();
         ctl.translate(text);
     }
 
@@ -378,6 +402,15 @@ public class MainActivity extends BaseActivity implements TranslatorController.L
             dirButtons[i].setEnabled(!busy);
         }
         btnSwap.setEnabled(!busy);
+        if (Prefs.pureMode()) {
+            btnSwap.setText(ctl.direction.label());
+        }
+        if (pendingPure && !busy) {
+            pendingPure = false;
+            if (!ctl.result.isEmpty()) {
+                ctl.draft = ctl.result;
+            }
+        }
 
         if (!ctl.draft.equals(shownDraft)) {
             if (!ctl.draft.equals(input.getText().toString())) {

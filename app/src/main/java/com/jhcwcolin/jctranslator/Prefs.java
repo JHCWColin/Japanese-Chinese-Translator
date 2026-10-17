@@ -84,7 +84,7 @@ public final class Prefs {
     }
 
     public static int textSizeSp() {
-        return TEXT_SIZES[textSizeIndex()];
+        return scaled(TEXT_SIZES[textSizeIndex()]);
     }
 
     public static void setTextSizeIndex(int idx) {
@@ -105,7 +105,7 @@ public final class Prefs {
     }
 
     public static int uiSizeSp() {
-        return UI_SIZES[uiSizeIndex()];
+        return scaled(UI_SIZES[uiSizeIndex()]);
     }
 
     public static void setUiSizeIndex(int idx) {
@@ -133,6 +133,97 @@ public final class Prefs {
 
     public static void setBold(boolean v) {
         sp.edit().putBoolean("bold", v).apply();
+        touch();
+    }
+
+    // ---- appearance personalisation ----------------------------------------------------------
+
+    public static final int[] FONT_SCALES = {80, 90, 100, 110, 125, 150};
+    /** Corner radius in dp for the three corner styles: square / slightly rounded / pill. */
+    public static final int[] CORNERS_DP = {0, 8, 24};
+    public static final int[] BORDERS_DP = {1, 2, 3, 4};
+    public static final int[] BUTTON_HEIGHTS_DP = {40, 52, 64, 76};
+
+    public static final int LAYOUT_AUTO = 0;
+    public static final int LAYOUT_STACKED = 1;
+    public static final int LAYOUT_SIDE = 2;
+
+    private static int scaled(int base) {
+        return Math.max(8, Math.round(base * FONT_SCALES[fontScaleIndex()] / 100f));
+    }
+
+    public static int fontScaleIndex() {
+        return Math.max(0, Math.min(FONT_SCALES.length - 1, sp.getInt("font_scale", 2)));
+    }
+
+    public static void setFontScaleIndex(int v) {
+        sp.edit().putInt("font_scale", v).apply();
+        touch();
+    }
+
+    public static int cornerIndex() {
+        return Math.max(0, Math.min(CORNERS_DP.length - 1, sp.getInt("corner", 0)));
+    }
+
+    public static int cornerDp() {
+        return CORNERS_DP[cornerIndex()];
+    }
+
+    public static void setCornerIndex(int v) {
+        sp.edit().putInt("corner", v).apply();
+        touch();
+    }
+
+    public static int borderIndex() {
+        return Math.max(0, Math.min(BORDERS_DP.length - 1, sp.getInt("border", 1)));
+    }
+
+    public static int borderDp() {
+        return BORDERS_DP[borderIndex()];
+    }
+
+    public static void setBorderIndex(int v) {
+        sp.edit().putInt("border", v).apply();
+        touch();
+    }
+
+    public static int buttonHeightIndex() {
+        return Math.max(0, Math.min(BUTTON_HEIGHTS_DP.length - 1, sp.getInt("button_height", 1)));
+    }
+
+    public static int buttonHeightDp() {
+        return BUTTON_HEIGHTS_DP[buttonHeightIndex()];
+    }
+
+    public static void setButtonHeightIndex(int v) {
+        sp.edit().putInt("button_height", v).apply();
+        touch();
+    }
+
+    public static int boxLayout() {
+        return sp.getInt("box_layout", LAYOUT_AUTO);
+    }
+
+    public static void setBoxLayout(int v) {
+        sp.edit().putInt("box_layout", v).apply();
+        touch();
+    }
+
+    public static boolean showStatus() {
+        return sp.getBoolean("show_status", true);
+    }
+
+    public static void setShowStatus(boolean v) {
+        sp.edit().putBoolean("show_status", v).apply();
+        touch();
+    }
+
+    public static boolean pureMode() {
+        return sp.getBoolean("pure_mode", false);
+    }
+
+    public static void setPureMode(boolean v) {
+        sp.edit().putBoolean("pure_mode", v).apply();
         touch();
     }
 
